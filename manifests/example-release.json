@@ -1,0 +1,26 @@
+{
+  "name": "示例发布单（复制一份改成你自己的，放 local/ 目录不会入库）",
+  "date": "2026-01-01",
+  "days": 1,
+
+  "sites": ["AR001", "AR002", "AR003"],
+
+  "components": {
+    "LotteryApi":     "master_V1.00_001",
+    "WebIntranetApi": "master_V1.00_001",
+    "Pages":          "masterBranch/main-1.00",
+    "ThirdApi":       "uat",
+    "ThirdJob":       "uat"
+  },
+
+  "excludeSites": ["AR000"],
+
+  "_说明": [
+    "sites 三种写法：",
+    "  1) 数组           手填站点编号",
+    "  2) \"*\"          全量，自动取所有拥有这些组件的站点，清单一行不用写",
+    "  3) sitesFile 字段 指向发布单原文 txt，正则抠 AR 编号（路径相对本文件）",
+    "更省事：命令行加 -FromClipboard，复制发布单后直接跑，连文件都不用建。",
+    "components 的键用 Jenkins 组件名；发布单写的 web 对应 Pages。"
+  ]
+}

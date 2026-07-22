@@ -1,0 +1,177 @@
+# Check-JenkinsRelease
+
+发版后一次性核对 Jenkins 上几百个 job：**哪些漏发了、哪些发错了 tag、哪些构建失败了。**
+
+适用于「一次发版横跨多个视图、多个站点、多个组件」的场景 —— 不用再逐个点开构建历史人工比对。
+**只读，不会触发任何构建。**
+
+提供两种用法：
+
+| | 适合 |
+|---|---|
+| `app.py` 网页版 | 发版收尾例行核对：把发布单整段粘进去，点一下出结果 |
+| `Check-JenkinsRelease.ps1` 命令行版 | 排查问题：分支 SHA 分布、构建历史、CSV 导出 |
+
+两者数据源和判定逻辑一致。
+
+---
+
+## 快速开始
+
+### 1. 拿一个 Jenkins API Token
+
+`https://<你的Jenkins>/me/security/` → API Token → 添加新 Token。**只显示一次，当场复制。**
+认证用户名填 Jenkins **登录名**，不是邮箱。
+
+### 2. 设环境变量
+
+```powershell
+$env:JENKINS_URL='https://your-jenkins-host'
+$env:JENKINS_USER='登录名'
+$env:JENKINS_API_TOKEN='刚复制的token'
+```
+
+### 3. 跑
+
+```powershell
+# 网页版
+python app.py                    # 浏览器开 http://127.0.0.1:8770
+
+# 命令行版
+.\Check-JenkinsRelease.ps1 -ListBranches
+```
+
+---
+
+## 网页版
+
+把发布单整段复制粘进文本框 → 点「开始检查」。**站点编号和组件 tag 全部自动解析**，不用手敲。
+
+支持的发布单写法：
+
+```
+【发布站点】
+（国家）AR001→SiteA
+（国家）AR002-SiteB
+
+【发布步骤】
+3.发布代码
+    LotteryApi      →   tag:   master_V1.00_001
+    web             →   分支:  masterBranch/main-1.00
+```
+
+也支持**站点分组**（同一组件按组发不同分支）：
+
+```
+中台站点
+    （国家）AR001-SiteA
+非中台站点
+    （国家）AR002-SiteB
+1.发代码
+    web  tag（中台）  : feature/v3
+    web  tag（非中台）: masterBranch/main-1.00
+```
+
+组件名容错：`web` / `Web-Pages` / `web-pages` / `WEB_PAGES` / `webpages` / `Web Pages` / `前端` / `页面`
+全部识别为 `Pages`。箭头可有可无，`tag:` / `分支:` / `branch:` 都认。
+
+站点编号容错：`AR51` / `ar-051` / `AR0051` 统一归成 `AR051`，自动去重，
+**发布单里写了但 Jenkins 上不存在的编号会单独报出来**（抓发布单笔误）。
+
+### 状态
+
+| 状态 | 含义 |
+|---|---|
+| 已发布 | 时间窗内构建成功，且 tag/分支与发布单一致 |
+| 未发布 | 时间窗内没有构建 —— 漏发 |
+| 构建失败 | FAILURE / ABORTED / UNSTABLE |
+| 版本不符 | 发了，但 tag/分支与发布单不一致 |
+| 构建中 | 还在跑 |
+| 无此任务 | 该站点没有这个组件的 job |
+
+### 「分支名一样但代码不一样」提示
+
+同一分支下出现多个 SHA 时会额外提示。这是**分支发版特有的坑**：
+
+分支是可变指针，Jenkins 构建时拿的是那一刻的分支顶端。一个站点一个站点手工点发，
+整个过程若跨了一两个小时，中间有人往分支推了代码，先发的站点拿到的就是旧代码 ——
+**分支名完全相同，报告全绿，但线上跑着好几份不同的代码。**
+
+用 tag 发版则不会有这个问题，tag 是不可变快照。
+
+这个提示不参与红绿判定（那几个提交可能是无关改动），只是提醒你去 GitLab 比一下：
+`<你的GitLab>/<项目>/-/compare/<旧SHA>...<新SHA>`
+
+---
+
+## 命令行版
+
+```powershell
+# 1) 全局体检：各分支的 SHA 分布，看有没有 job 停在旧代码
+.\Check-JenkinsRelease.ps1 -ListBranches
+
+# 2) 按分支核对：以该分支最新 SHA 为基准，找出没跟上的
+.\Check-JenkinsRelease.ps1 -Branch 'masterBranch/main-1.00' -OnlyProblem
+
+# 3) 构建历史：某天/某几天，可按视图、站点、组件过滤
+.\Check-JenkinsRelease.ps1 -History -View 'Web-Pages'
+.\Check-JenkinsRelease.ps1 -History -Date '2026-01-01' -Days 3 -OnlyProblem
+.\Check-JenkinsRelease.ps1 -History -Site 'AR001','AR002'
+.\Check-JenkinsRelease.ps1 -History -Component 'LotteryApi','ThirdJob'
+
+# 4) 按发布单核对：出「站点 × 组件」矩阵
+.\Check-JenkinsRelease.ps1 -Manifest .\manifests\example-release.json
+.\Check-JenkinsRelease.ps1 -Manifest .\my.json -FromClipboard    # 复制发布单后直接跑
+.\Check-JenkinsRelease.ps1 -Manifest .\my.json -ParseOnly        # 先看站点抠对没
+```
+
+通用参数：`-View` `-Site` `-Component` `-Job`（通配符）`-IgnoreJob` `-ExcludeSite`
+`-OnlyProblem` `-CsvPath` `-MaxPerJob` `-SkipCertCheck`
+
+---
+
+## 依赖前提
+
+工具假设 job 命名遵循 `AR{编号}-{组件}-{国家}-{站点名}`，组件取第二段。
+**命名规约不同的话要改 `site_of()` / `component_of()`（Python）
+和 `Get-SiteCode` / `Get-Component`（PowerShell）。**
+
+组件名到 Jenkins 视图名的映射在 `COMPONENT_VIEW`，别名在 `COMPONENT_ALIAS`。
+
+- Python 3.8+（只用标准库，无第三方依赖）
+- PowerShell 5.1+
+
+---
+
+## 踩过的坑（改代码前先看）
+
+1. **WAF 按 User-Agent 拦截** —— `python-urllib` 默认 UA 直接 403，必须伪装浏览器 UA。
+   PowerShell 的 `Invoke-WebRequest` 不受影响，所以只在 Python 侧会踩到。
+2. **参数名不统一** —— Api/Job/Web 类的版本参数叫 `TAG`，Pages 类叫 `BRANCH_NAME`，两个都要试。
+3. **分支名必须归一化** —— Git 插件把分支记成 `refs/remotes/origin/xxx`，参数里写的是 `xxx`，
+   不剥前缀会产生几百条假告警。
+4. **判定要用 SHA 而不是 tag 字符串** —— `master` / `uat` 这类浮动分支，tag 值永远相同，看它等于没看。
+5. **同一 job 会挂多个视图** —— 按 job url 去重，否则重复统计。
+6. **PowerShell：变量名不区分大小写** —— 内部变量 `$views` 会和参数 `$View` 撞成同一个。
+7. **PowerShell：`.ps1` 含中文必须存成 UTF-8 with BOM**，否则 PS 5.1 解析报错。
+8. **PowerShell：`Group-Object` 只有一个分组时 `.Count` 返回组内元素数**，不是分组数，要用 `@()` 包住。
+9. **终端里中文占 2 个显示宽度**，`.Length` 算 1，用 `"{0,-44}"` 格式化会错位。
+
+---
+
+## 安全
+
+- **Token 只从环境变量读，任何文件里都没有硬编码。**
+- 网页版**只监听 `127.0.0.1`**：后端持 Token 转发，Token 不出本机。
+- `local/` 已在 `.gitignore` 里 —— 真实发布单、真实站点清单放这儿，不会入库。
+
+### 要部署到服务器给团队用
+
+现在这版**不能直接放服务器**，按顺序补三件事：
+
+1. **加登录。** 现在任何能访问该端口的人，都在用部署者的 Token 查数据，等于绕过 Jenkins 权限。
+   建议改成「每个人填自己的 Token」（存浏览器 sessionStorage，后端不落盘）。
+2. **放内网，别放公网。** 这是发版数据。
+3. **反代 + HTTPS。** nginx 转发到 `127.0.0.1:8770`，配证书；同时把监听地址保持在回环。
+
+在补齐 1 之前，本机自己用是最安全的。

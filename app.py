@@ -1,0 +1,648 @@
+# -*- coding: utf-8 -*-
+"""
+Jenkins 发版核对 · 本地网页版
+
+用法：
+    $env:JENKINS_USER='logan'; $env:JENKINS_API_TOKEN='xxxx'
+    python app.py                     # 然后浏览器开 http://127.0.0.1:8770
+
+把发布单整段复制粘进网页文本框，点「开始检查」，按视图分组列出每个站点的发版结果。
+
+为什么必须有这个后端、不能做成纯静态网页：
+  1. Jenkins 没开 CORS，浏览器直接调 /api/json 会被跨域拦掉；
+  2. API Token 若放前端 JS，等于谁打开网页谁就有你的 Jenkins 权限。
+后端在本机持有 Token 并转发，前端只跟 127.0.0.1 说话，Token 不出这台机器。
+
+只读，不会触发任何构建。零第三方依赖（Python 标准库）。
+"""
+import base64
+import json
+import os
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+JENKINS_URL = os.environ.get("JENKINS_URL", "https://your-jenkins-host").rstrip("/")
+JENKINS_USER = os.environ.get("JENKINS_USER", "")
+JENKINS_TOKEN = os.environ.get("JENKINS_API_TOKEN", "")
+PORT = int(os.environ.get("JENKINS_WEB_PORT", "8770"))
+MAX_BUILDS_PER_JOB = int(os.environ.get("JENKINS_MAX_BUILDS", "30"))
+CACHE_TTL = 60  # 秒。同一次发版核对往往要连点几次，缓存一分钟避免反复拉全量
+
+# job 命名规约：AR{编号}-{组件}-{国家}-{站点名}
+# 发布单里写的组件名和 Jenkins 里的组件名对不上，这里做别名映射。
+# 键一律用 canon() 归一后的形式：转小写、去掉空格/连字符/下划线。
+# 这样 "Web-Pages" / "web pages" / "webpages" / "WEB_PAGES" 都归到同一个键，不用逐个列。
+COMPONENT_ALIAS = {
+    "web": "Pages", "pages": "Pages", "webpages": "Pages",
+    "前端": "Pages", "web页面": "Pages", "页面": "Pages", "前端页面": "Pages",
+    "lotteryapi": "LotteryApi", "lottery": "LotteryApi",
+    "webintranetapi": "WebIntranetApi", "intranetapi": "WebIntranetApi",
+    "webextendapi": "WebExtendApi", "extendapi": "WebExtendApi",
+    "agentapi": "AgentApi",
+    "webagent": "Web", "agentweb": "Web",
+    "thirdapi": "ThirdApi",
+    "thirdjob": "ThirdJob",
+}
+
+
+def canon(s):
+    """组件名归一：小写 + 去空格/连字符/下划线。发布单里同一个组件有七八种写法。"""
+    return re.sub(r"[\s\-_]+", "", (s or "").strip().lower())
+# 组件 -> Jenkins 视图名，页面上按视图分组展示
+COMPONENT_VIEW = {
+    "Pages": "Web-Pages", "LotteryApi": "LotteryApi", "AgentApi": "AgentApi",
+    "Web": "Agent_Web", "WebExtendApi": "WebExtendApi",
+    "WebIntranetApi": "WebIntranetApi", "ThirdApi": "ThirdApi", "ThirdJob": "ThirdJob",
+}
+# 发布单里会出现、但不在这套 AR 命名的 Jenkins 上的组件
+NOT_IN_JENKINS = {"admin", "sitadmin", "后台", "后台管理"}
+
+_cache = {"ts": 0.0, "jobs": None}
+
+
+# ---------------------------------------------------------------- Jenkins 访问
+def jenkins_get(path):
+    url = JENKINS_URL + path
+    req = urllib.request.Request(url)
+    token = base64.b64encode(f"{JENKINS_USER}:{JENKINS_TOKEN}".encode("ascii")).decode("ascii")
+    req.add_header("Authorization", "Basic " + token)
+    # 站点前面有 WAF，会按 User-Agent 拦截：python-urllib 的默认 UA 直接 403，必须伪装成浏览器
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JenkinsReleaseCheck/1.0")
+    ctx = ssl.create_default_context()
+    if os.environ.get("JENKINS_SKIP_CERT") == "1":
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=180, context=ctx) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_all_jobs(force=False):
+    """拉全部 job 及其最近 N 次构建。一次请求拿完，别按视图拉（同 job 挂多视图会重复）。"""
+    now = time.time()
+    if not force and _cache["jobs"] is not None and now - _cache["ts"] < CACHE_TTL:
+        return _cache["jobs"]
+    tree = (
+        "jobs[name,url,builds[number,result,building,timestamp,duration,url,actions["
+        "parameters[name,value],lastBuiltRevision[SHA1,branch[name,SHA1]],"
+        "causes[userName,shortDescription]]]{0,%d}]" % MAX_BUILDS_PER_JOB
+    )
+    data = jenkins_get("/api/json?tree=" + urllib.parse.quote(tree, safe="[]{},"))
+    jobs = data.get("jobs", []) or []
+    _cache["jobs"] = jobs
+    _cache["ts"] = now
+    return jobs
+
+
+# ---------------------------------------------------------------- 解析与判定
+def normalize_ref(s):
+    """Git 插件把分支记成 refs/remotes/origin/xxx，参数里写的是 xxx，不剥前缀会满屏假告警。"""
+    if not s:
+        return ""
+    for p in ("refs/remotes/", "refs/heads/", "origin/"):
+        if s.startswith(p):
+            s = s[len(p):]
+    return s
+
+
+def site_of(job_name):
+    m = re.match(r"^(AR\d+)-", job_name)
+    return m.group(1) if m else ""
+
+
+def component_of(job_name):
+    m = re.match(r"^AR\d+-([^-]+)-", job_name)
+    return m.group(1) if m else ""
+
+
+def presplit(text):
+    """复制发布单时常丢换行，导致「AR002-SiteB【发布步骤】」粘成一行。在【】标题前补回换行。"""
+    return re.sub(r"(?<!\n)(【)", r"\n\1", text or "")
+
+
+def parse_sites(text):
+    """从发布单原文抠 AR 编号。兼容 AR51 / ar-051 / AR0051，统一补成 3 位。"""
+    out = []
+    for m in re.finditer(r"(?i)\bAR[-_ ]?0*(\d{1,4})\b", text or ""):
+        code = "AR" + m.group(1).zfill(3)
+        if code not in out:
+            out.append(code)
+    return sorted(out)
+
+
+def canon_group(s):
+    """分组名归一：去掉「站点/的/：」等修饰，「中台站点」->「中台」，「非中台站点」->「非中台」。"""
+    s = re.sub(r"[\s:：]+", "", (s or "").strip())
+    s = re.sub(r"(站点|站台|的)$", "", s)
+    return s
+
+
+def parse_groups(text):
+    """
+    发布单会把站点分组，同一组件按组发不同分支，例如：
+        中台站点
+            （国家）AR001-SiteA
+        非中台站点
+            （国家）AR002-SiteB
+    返回 {站点编号: 分组名}。没有分组时全部为 ''。
+    """
+    groups, cur = {}, ""
+    for line in presplit(text).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        codes = parse_sites(s)
+        if codes:
+            for c in codes:
+                groups.setdefault(c, cur)
+            continue
+        # 分组标题：短、无 AR 编号、不是步骤行、不含箭头或 tag/分支关键字
+        if (len(s) <= 16 and not s.startswith("【") and not re.match(r"^\d+\s*[.、]", s)
+                and not re.search(r"(?i)(→|->|=>|➔|⇒|tag|分支|branch|标签)", s)):
+            cur = canon_group(s)
+    return groups
+
+
+def parse_components(text):
+    """
+    从发布单【发布代码】段抠出 组件 -> 期望 tag/分支。识别形如：
+        LotteryApi    →    tag:   master_V3.08_001
+        web           →    分支:  masterBranch/main-3.04
+        ThirdApi:     ->   分支： uat
+    返回 (components, warnings)
+    """
+    comps, warns, seen = [], [], set()
+    # 两种写法都要吃下：
+    #   有箭头： LotteryApi  →  tag: master_V3.08_001
+    #   无箭头： web  tag（非中台）: masterBranch/main-3.04
+    # 所以箭头和 tag/分支 关键字都是可选的，但至少得有一个（否则随便一行 a:b 都会被当组件）。
+    # 括号里的限定词（中台/非中台）表示这条只对该分组的站点生效。
+    # 组件名允许含空格（"Web Pages"），非贪婪 + 结尾锚定，否则空格写法整行失配 ——
+    # 那是最危险的情况：发布单里有这个组件，工具当没看见，报告还显示「全部通过」。
+    pat = re.compile(
+        r"^\s*(?P<name>[A-Za-z0-9_\- 一-龥]+?)\s*"
+        r"(?:[（(](?P<q1>[^）)]*)[）)])?\s*"
+        r"(?:(?P<arrow>→|->|=>|➔|⇒|➜)\s*)?"
+        r"(?:(?P<kw>tag|分支|branch|标签|tag名|分支名)\s*)?"
+        r"(?:[（(](?P<q2>[^）)]*)[）)])?\s*"
+        r"[:：]?\s*(?P<val>\S+)\s*$",
+        re.IGNORECASE,
+    )
+    for line in presplit(text).splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        if not (m.group("arrow") or m.group("kw")):
+            continue  # 既没箭头也没 tag/分支 关键字，不是组件行
+        raw, expect = m.group("name").strip(), m.group("val").strip()
+        group = canon_group(m.group("q2") or m.group("q1") or "")
+        # 站点行「（国家）AR001→SiteA」也带箭头，会撞进来，按 AR 编号剔掉
+        if re.match(r"(?i)^\(?[^)]*\)?\s*AR\d", raw) or re.search(r"(?i)\bAR\d{2,4}\b", raw):
+            continue
+        key = canon(raw)
+        if not key:
+            continue
+        if key in NOT_IN_JENKINS:
+            warns.append(f"发布单里的「{raw} → {expect}」不在这套 Jenkins 上（属于另一套后台部署），本次未核对")
+            continue
+        name = COMPONENT_ALIAS.get(key)
+        if not name:
+            # 也允许直接写 Jenkins 里的组件名本身
+            for v in set(COMPONENT_ALIAS.values()):
+                if canon(v) == key:
+                    name = v
+                    break
+        if not name:
+            warns.append(f"不认识的组件名「{raw} → {expect}」，已跳过（未核对）。"
+                         f"可用：{', '.join(sorted(set(COMPONENT_ALIAS.values())))}")
+            continue
+        # 同一组件可以出现多次，只要分组不同（中台发 feature/v3、非中台发 main-3.04）
+        k = (name, group)
+        if k in seen:
+            continue
+        seen.add(k)
+        comps.append({"key": f"{name}@{group}", "name": name, "expect": expect,
+                      "raw": raw, "group": group})
+    return comps, warns
+
+
+def read_build(b):
+    ts = int(b.get("timestamp") or 0) / 1000.0
+    acts = [a for a in (b.get("actions") or []) if isinstance(a, dict)]
+    params = []
+    for a in acts:
+        if a.get("parameters"):
+            params.extend(a["parameters"])
+    # 参数名不统一：Api/Job/Web 类叫 TAG，Pages 类叫 BRANCH_NAME，两个都试
+    want = ""
+    for p in params:
+        if p.get("name") in ("TAG", "BRANCH_NAME"):
+            want = p.get("value") or ""
+            break
+    got, sha = "", ""
+    for a in acts:
+        rev = a.get("lastBuiltRevision")
+        if rev:
+            br = (rev.get("branch") or [{}])[0]
+            got = br.get("name") or ""
+            sha = (rev.get("SHA1") or "")[:7]
+            break
+    who = ""
+    for a in acts:
+        if a.get("causes"):
+            c = a["causes"][0]
+            who = c.get("userName") or c.get("shortDescription") or ""
+            break
+    return {
+        "num": b.get("number"),
+        "result": "BUILDING" if b.get("building") else (b.get("result") or ""),
+        "ts": ts,
+        "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S") if ts else "",
+        "dur": round((b.get("duration") or 0) / 1000),
+        "want": normalize_ref(want),
+        "got": normalize_ref(got),
+        "sha": sha,
+        "who": who,
+        "params": "; ".join(f"{p.get('name')}={p.get('value')}" for p in params),
+        "url": b.get("url") or "",
+    }
+
+
+def run_check(text, date_str, days, exclude, all_sites, force):
+    jobs = fetch_all_jobs(force=force)
+    comps, warns = parse_components(text)
+    sites = parse_sites(text)
+    site_group = parse_groups(text)      # {站点: 分组}，无分组时为 ''
+
+    day0 = datetime.strptime(date_str, "%Y-%m-%d")
+    frm = day0.timestamp()
+    to = (day0 + timedelta(days=max(1, days))).timestamp()
+
+    if not comps:
+        warns.append("发布单里没解析出组件行（形如「LotteryApi → tag: xxx」或「web → 分支: xxx」），请检查粘贴内容")
+        return {"ok": False, "warnings": warns, "sites": sites, "components": [], "rows": []}
+
+    known = sorted({site_of(j["name"]) for j in jobs if site_of(j["name"])})
+    comp_names = {c["name"] for c in comps}
+
+    if all_sites:
+        # 全量：凡是拥有本次任一组件的站点全部纳入，清单一行不用写，也就抄不漏
+        sites = sorted({site_of(j["name"]) for j in jobs
+                        if site_of(j["name"]) and component_of(j["name"]) in comp_names})
+        src = "全量（所有拥有这些组件的站点）"
+    else:
+        src = "发布单正文解析"
+    if not sites:
+        warns.append("没解析出任何 AR 站点编号")
+
+    exclude = {e.strip().upper() for e in exclude if e.strip()}
+    if exclude:
+        sites = [s for s in sites if s not in exclude]
+    unknown = [s for s in sites if s not in known]
+
+    # 站点展示名：优先取 Pages 任务的最后一段（英文站点名，如 tiranga），
+    # 没有就退而取任意 4 段以上任务名的最后一段。直接遍历取第一个会拿到「印度」这种国家名。
+    disp = {}
+    for prefer in ("Pages", "LotteryApi", None):
+        for j in jobs:
+            s = site_of(j["name"])
+            if not s or s in disp:
+                continue
+            if prefer and component_of(j["name"]) != prefer:
+                continue
+            parts = j["name"].split("-")
+            if len(parts) >= 4 and parts[-1]:
+                disp[s] = parts[-1]
+
+    # 组件带了分组限定词（如「web tag（中台）」）时，只核对属于该分组的站点。
+    # 没有限定词的组件对所有站点生效。
+    group_names = {c["group"] for c in comps if c["group"]}
+    if group_names:
+        unmatched = sorted({site_group.get(s, "") for s in sites} - group_names - {""})
+        if unmatched:
+            warns.append("这些站点分组在发布代码里没有对应的分支说明，未核对：" + ", ".join(unmatched))
+
+    rows = []
+    for c in comps:
+        expect = normalize_ref(c["expect"])
+        comp_sites = [s for s in sites
+                      if not c["group"] or site_group.get(s, "") == c["group"]]
+        if c["group"] and not comp_sites:
+            warns.append(f"发布代码里写了「{c['raw']}（{c['group']}）」，但站点清单里没有「{c['group']}」分组的站点")
+        for s in comp_sites:
+            matched = [j for j in jobs
+                       if re.match(r"^%s-%s(-|$)" % (re.escape(s), re.escape(c["name"])), j["name"])]
+            if not matched:
+                rows.append({"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
+                             "group": c["group"], "view": COMPONENT_VIEW.get(c["name"], ""), "job": "",
+                             "state": "NOJOB", "expect": c["expect"], "detail": "该站点没有这个任务"})
+                continue
+            for j in matched:
+                inwin = sorted(
+                    [x for x in (read_build(b) for b in (j.get("builds") or [])) if frm <= x["ts"] < to],
+                    key=lambda x: x["ts"], reverse=True)
+                # 同站点同组件可能有多个 job（如 某站点的 Pages 有 5 个），
+                # 用去掉「AR###-组件-」前缀后的剩余部分区分，否则色块长得一模一样
+                suffix = re.sub(r"^%s-%s-?" % (re.escape(s), re.escape(c["name"])), "", j["name"])
+                base = {"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
+                        "group": c["group"], "view": COMPONENT_VIEW.get(c["name"], ""), "job": j["name"],
+                        "jobSuffix": suffix if len(matched) > 1 else "", "expect": c["expect"]}
+                if not inwin:
+                    rows.append(dict(base, state="MISS", detail="时间窗内没有构建", url=j.get("url", "")))
+                    continue
+                b = inwin[0]  # 窗口内最后一次构建为准
+                actual = b["want"] or b["got"]
+                if b["result"] == "BUILDING":
+                    st, detail = "RUN", f"#{b['num']} 正在构建中"
+                elif b["result"] != "SUCCESS":
+                    st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
+                elif expect and actual and normalize_ref(actual) != expect:
+                    st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
+                else:
+                    st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
+                rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
+                                 time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"], actual=actual,
+                                 dur=b["dur"], url=b["url"]))
+
+    summary = {}
+    for r in rows:
+        summary[r["state"]] = summary.get(r["state"], 0) + 1
+    if unknown:
+        warns.append("这些编号 Jenkins 上不存在，请核对发布单：" + ", ".join(unknown))
+
+    return {"ok": True, "source": src, "date": date_str, "days": days,
+            "sites": sites, "unknown": unknown, "components": comps,
+            "rows": rows, "summary": summary, "warnings": warns,
+            "cachedAt": datetime.fromtimestamp(_cache["ts"]).strftime("%H:%M:%S")}
+
+
+# ---------------------------------------------------------------- HTTP
+PAGE = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jenkins 发版核对</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1a1d21;--mut:#6b7280;--bd:#e3e6ea;
+--ok:#0f9960;--okbg:#e6f5ee;--bad:#d3392f;--badbg:#fdeceb;--warn:#b7791f;--warnbg:#fdf6e3;
+--run:#1c7ed6;--runbg:#e7f2fd;--none:#9aa3ad;--nonebg:#f0f2f4;}
+@media(prefers-color-scheme:dark){:root{--bg:#14171a;--card:#1c2024;--fg:#e6e8ea;--mut:#9aa3ad;--bd:#2c3238;
+--okbg:#122b20;--badbg:#2e1614;--warnbg:#2c2413;--runbg:#12212f;--nonebg:#22272b;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:24px 18px 60px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--mut);font-size:13px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:16px}
+textarea{width:100%;min-height:190px;padding:11px;border:1px solid var(--bd);border-radius:8px;
+background:var(--bg);color:var(--fg);font:12.5px/1.6 Consolas,"Cascadia Mono",monospace;resize:vertical}
+.ctl{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;margin-top:12px}
+.f{display:flex;flex-direction:column;gap:5px}
+.f label{font-size:12px;color:var(--mut)}
+input[type=date],input[type=number],input[type=text]{padding:7px 9px;border:1px solid var(--bd);
+border-radius:7px;background:var(--bg);color:var(--fg);font:13px inherit}
+input[type=text]{min-width:210px}
+.chk{flex-direction:row;align-items:center;gap:7px;padding-bottom:7px}
+button{padding:9px 20px;border:0;border-radius:7px;background:#2b6cb0;color:#fff;font-size:14px;
+font-weight:600;cursor:pointer}
+button:hover{background:#255990}button:disabled{opacity:.55;cursor:default}
+button.sec{background:transparent;color:var(--mut);border:1px solid var(--bd);font-weight:400}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 14px}
+.pill{padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600}
+.OK{background:var(--okbg);color:var(--ok)}.MISS,.FAIL{background:var(--badbg);color:var(--bad)}
+.VER{background:var(--warnbg);color:var(--warn)}.RUN{background:var(--runbg);color:var(--run)}
+.NOJOB{background:var(--nonebg);color:var(--none)}
+.warn{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:9px 12px;margin-bottom:9px;font-size:13px}
+h2{font-size:15px;margin:22px 0 4px;display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+h2 .tag{font:12px Consolas,monospace;color:var(--mut);font-weight:400}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:7px;margin-top:9px}
+.cell{border:1px solid var(--bd);border-radius:7px;padding:7px 9px;font-size:12.5px;cursor:default}
+.cell b{display:block;font-size:13px}
+.cell small{color:var(--mut);font-size:11px}
+.br{font:12px Consolas,"Cascadia Mono",monospace;margin:3px 0 1px;word-break:break-all}
+.br.diff{color:var(--bad);font-weight:700}
+.sfx{display:block;font:10.5px Consolas,monospace;color:var(--mut);opacity:.8;margin-top:2px}
+details{margin-top:10px}
+summary{cursor:pointer;color:var(--mut);font-size:12.5px;user-select:none}
+summary:hover{color:var(--fg)}
+.cell.s-OK{background:var(--okbg);border-color:transparent}
+.cell.s-MISS,.cell.s-FAIL{background:var(--badbg);border-color:transparent}
+.cell.s-VER{background:var(--warnbg);border-color:transparent}
+.cell.s-RUN{background:var(--runbg);border-color:transparent}
+.cell.s-NOJOB{background:var(--nonebg);border-color:transparent;opacity:.65}
+table{width:100%;border-collapse:collapse;margin-top:9px;font-size:12.5px}
+th,td{text-align:left;padding:6px 9px;border-bottom:1px solid var(--bd);vertical-align:top}
+th{color:var(--mut);font-weight:600;font-size:12px}
+td a{color:inherit}
+.st{font-weight:700;white-space:nowrap}
+.st.OK{color:var(--ok)}.st.MISS,.st.FAIL{color:var(--bad)}.st.VER{color:var(--warn)}.st.RUN{color:var(--run)}
+.empty{color:var(--mut);padding:22px;text-align:center}
+.tbwrap{overflow-x:auto}
+</style></head><body><div class="wrap">
+<h1>Jenkins 发版核对</h1>
+<div class="sub">把发布单整段复制粘进来 → 点「开始检查」。站点编号和组件 tag 都自动解析，只读不触发构建。</div>
+
+<div class="card">
+  <textarea id="txt" placeholder="把发布单整段粘贴到这里，例如：
+
+【发布站点】
+（国家）AR001→SiteA
+（国家）AR002→SiteB
+...
+
+【发布步骤】
+3.发布代码
+    LotteryApi      →   tag:   master_V3.08_001
+    WebIntranetApi  →   tag:   master_V3.08_001
+    web             →   分支:  masterBranch/main-3.04
+    ThirdApi:       →   分支:  uat
+    ThirdJob:       →   分支:  uat"></textarea>
+  <div class="ctl">
+    <div class="f"><label>发版日期</label><input type="date" id="date"></div>
+    <div class="f"><label>往后几天</label><input type="number" id="days" value="1" min="1" max="30" style="width:76px"></div>
+    <div class="f"><label>排除站点（逗号分隔）</label><input type="text" id="ex" value="AR000"></div>
+    <div class="f chk"><input type="checkbox" id="all"><label for="all">忽略站点清单，核对全部站点</label></div>
+    <div class="f chk"><input type="checkbox" id="prob"><label for="prob">只看有问题的</label></div>
+    <div class="f"><button id="go">开始检查</button></div>
+    <div class="f"><button id="refresh" class="sec" title="跳过 60 秒缓存，重新拉取 Jenkins">强制刷新</button></div>
+  </div>
+</div>
+<div id="out"></div>
+</div>
+<script>
+const $=i=>document.getElementById(i);
+const LABEL={OK:'已发布',MISS:'未发布',FAIL:'构建失败',VER:'版本不符',RUN:'构建中',NOJOB:'无此任务'};
+$('date').value=new Date().toLocaleDateString('sv');   // sv locale 天然是 YYYY-MM-DD
+
+async function check(force){
+  const t=$('txt').value.trim();
+  if(!t){$('out').innerHTML='<div class="card empty">先把发布单粘贴到上面的文本框</div>';return;}
+  $('go').disabled=true;$('go').textContent='检查中…';
+  try{
+    const r=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:t,date:$('date').value,days:+$('days').value,
+        exclude:$('ex').value.split(/[,，\s]+/),all:$('all').checked,force:!!force})});
+    const d=await r.json();
+    if(d.error){$('out').innerHTML='<div class="card warn">出错：'+esc(d.error)+'</div>';return;}
+    render(d);
+  }catch(e){$('out').innerHTML='<div class="card warn">请求失败：'+esc(e.message)+'</div>';}
+  finally{$('go').disabled=false;$('go').textContent='开始检查';}
+}
+$('go').onclick=()=>check(false);
+$('refresh').onclick=()=>check(true);
+$('prob').onchange=()=>{if(window.__d)render(window.__d);};
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// 和后端同一套归一化：Git 插件把分支记成 refs/remotes/origin/xxx，比对前要剥前缀
+const norm=s=>String(s||'').replace(/^refs\/remotes\//,'').replace(/^refs\/heads\//,'').replace(/^origin\//,'');
+
+function render(d){
+  window.__d=d;
+  const only=$('prob').checked, BAD=['MISS','FAIL','VER','RUN'];
+  let h='';
+  (d.warnings||[]).forEach(w=>h+='<div class="warn">⚠ '+esc(w)+'</div>');
+  if(!d.ok){$('out').innerHTML=h||'<div class="card empty">没解析出内容</div>';return;}
+
+  h+='<div class="card"><div class="pills">';
+  ['OK','VER','FAIL','MISS','RUN','NOJOB'].forEach(k=>{if(d.summary[k])
+    h+='<span class="pill '+k+'">'+LABEL[k]+' '+d.summary[k]+'</span>';});
+  h+='</div><div class="sub" style="margin:0">站点来源：'+esc(d.source)+' · '+d.sites.length+
+     ' 个站点 × '+d.components.length+' 个组件 · 时间窗 '+esc(d.date)+
+     (d.days>1?' 起 '+d.days+' 天':'')+' · 数据快照 '+esc(d.cachedAt)+'</div></div>';
+
+  const bad=d.rows.filter(r=>BAD.includes(r.state));
+  if(bad.length){
+    h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+bad.length+' 项</span></h2><div class="tbwrap"><table>'+
+       '<tr><th>状态</th><th>站点</th><th>任务</th><th>说明</th></tr>';
+    bad.sort((a,b)=>BAD.indexOf(a.state)-BAD.indexOf(b.state));
+    bad.forEach(r=>{h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
+      (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
+      (r.url?'<a href="'+esc(r.url)+'" target="_blank">'+esc(r.job||'-')+'</a>':esc(r.job||'-'))+
+      '</td><td>'+esc(r.detail)+'</td></tr>';});
+    h+='</table></div></div>';
+  }
+
+  h+='<div class="card">';
+  d.components.forEach(c=>{
+    let rows=d.rows.filter(r=>r.compKey===c.key);
+    if(only)rows=rows.filter(r=>BAD.includes(r.state));
+    h+='<h2>'+esc(c.name)+(c.group?' <span class=\"pill VER\" style=\"font-size:12px\">'+esc(c.group)+'</span>':'')+' <span class=\"tag\">视图 '+esc(d.rows.find(r=>r.compKey===c.key)?.view||'')+
+       ' · 发布单写的是「'+esc(c.raw)+'」 · 期望 '+esc(c.expect)+'</span></h2>';
+    if(!rows.length){h+='<div class="sub" style="margin:6px 0 0">'+(only?'该组件全部通过':'无数据')+'</div>';return;}
+    // 分支名相同不等于代码相同：期间有人往分支推了新提交，先发的站点就落后了。
+    // 这个只有比 SHA 才看得出来，光看分支名会漏。
+    const all=d.rows.filter(r=>r.compKey===c.key&&r.sha);
+    const shas={};all.forEach(r=>{(shas[r.sha]=shas[r.sha]||[]).push(r)});
+    const keys=Object.keys(shas);
+    if(keys.length>1){
+      // 用后端给的时间戳数值排。别用 time 字符串——Math.max("07-14 16:49:00") 是 NaN，会把最旧的标成最新
+      const lastTs=k=>Math.max.apply(null,shas[k].map(r=>r.ts||0));
+      const firstTs=k=>Math.min.apply(null,shas[k].map(r=>r.ts||0));
+      keys.sort((a,b)=>lastTs(b)-lastTs(a));          // 最新的排最前
+      const newest=keys[0];
+      const fmt=t=>{const d=new Date(t*1000);const p=n=>String(n).padStart(2,'0');
+                    return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());};
+      h+='<div class="warn" style="margin:8px 0 0">⚠ 分支名一样但代码不一样：本组件出现 '+keys.length+
+         ' 个不同 SHA，说明期间分支上有新提交，先发的站点代码是旧的。'+
+         keys.map(k=>'<br>&nbsp;&nbsp;<code>'+esc(k)+'</code> · '+
+           [...new Set(shas[k].map(r=>r.site))].length+' 个站点 · '+
+           fmt(firstTs(k))+' ~ '+fmt(lastTs(k))+
+           (k===newest?' <b>（最新）</b>':' <b style="color:var(--bad)">（落后）</b>')+' · '+
+           esc([...new Set(shas[k].map(r=>r.site))].join(', '))).join('')+
+         '</div>';
+    }
+    h+='<div class="grid">';
+    rows.forEach(r=>{
+      const diff=r.actual&&norm(r.actual)!==norm(c.expect);
+      h+='<div class="cell s-'+r.state+'" title="'+esc(r.job+'\n'+r.detail)+'">'+
+      '<b>'+esc(r.site)+(r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</b>'+
+      '<div class="br'+(diff?' diff':'')+'">'+esc(r.actual||'—')+'</div>'+
+      '<span class="st '+r.state+'" style="font-size:11.5px">'+LABEL[r.state]+'</span>'+
+      (r.num?' <small>#'+r.num+'</small>':'')+
+      (r.sha?' <small>'+esc(r.sha)+'</small>':'')+
+      (r.time?' <small>'+esc(r.time.slice(0,11))+'</small>':'')+
+      (r.jobSuffix?'<span class="sfx">'+esc(r.jobSuffix)+'</span>':'')+'</div>';});
+    h+='</div>';
+    // 明细表：色块看趋势，表格看逐条，可复制可贴群
+    h+='<details><summary>展开明细表（'+rows.length+' 条 · 站点/任务/分支/SHA/构建号/时间/触发人）</summary>'+
+       '<div class="tbwrap"><table><tr><th>状态</th><th>站点</th><th>任务</th><th>实际分支/tag</th>'+
+       '<th>SHA</th><th>构建</th><th>时间</th><th>耗时</th><th>触发人</th></tr>';
+    rows.forEach(r=>{
+      const diff=r.actual&&norm(r.actual)!==norm(c.expect);
+      h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
+        (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
+        (r.url?'<a href="'+esc(r.url)+'" target="_blank">'+esc(r.job||'-')+'</a>':esc(r.job||'-'))+
+        '</td><td'+(diff?' style="color:var(--bad);font-weight:700"':'')+'>'+esc(r.actual||'—')+'</td><td>'+
+        esc(r.sha||'')+'</td><td>'+(r.num?'#'+r.num:'')+'</td><td>'+esc(r.time||'')+'</td><td>'+
+        (r.dur?r.dur+'s':'')+'</td><td>'+esc(r.who||'')+'</td></tr>';});
+    h+='</table></div></details>';
+  });
+  h+='</div>';
+  $('out').innerHTML=h;
+}
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("  %s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, code, body, ctype):
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path.split("?")[0] in ("/", "/index.html"):
+            self._send(200, PAGE, "text/html")
+        else:
+            self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        if self.path != "/api/check":
+            self._send(404, json.dumps({"error": "not found"}), "application/json")
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n).decode("utf-8"))
+            res = run_check(
+                req.get("text", ""),
+                req.get("date") or datetime.now().strftime("%Y-%m-%d"),
+                int(req.get("days") or 1),
+                req.get("exclude") or [],
+                bool(req.get("all")),
+                bool(req.get("force")),
+            )
+            self._send(200, json.dumps(res, ensure_ascii=False), "application/json")
+        except urllib.error.HTTPError as e:
+            msg = f"Jenkins 返回 HTTP {e.code}" + ("（认证失败，检查 JENKINS_USER / JENKINS_API_TOKEN）" if e.code in (401, 403) else "")
+            self._send(200, json.dumps({"error": msg}, ensure_ascii=False), "application/json")
+        except Exception as e:
+            self._send(200, json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False), "application/json")
+
+
+def main():
+    if not JENKINS_USER or not JENKINS_TOKEN:
+        print("缺认证。先设置环境变量：")
+        print("  $env:JENKINS_USER='登录名'")
+        print("  $env:JENKINS_API_TOKEN='APIToken'   # 在 %s/me/security/ 生成" % JENKINS_URL)
+        sys.exit(1)
+    # 只监听 127.0.0.1：Token 在本机，别把这个口暴露到局域网/公网
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print("Jenkins : %s  (用户 %s)" % (JENKINS_URL, JENKINS_USER))
+    print("网页已启动: http://127.0.0.1:%d   按 Ctrl+C 停止" % PORT)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
+
+
+if __name__ == "__main__":
+    main()

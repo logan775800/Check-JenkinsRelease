@@ -1,0 +1,27 @@
+# ---- 绝对不能入库 ----
+# 真实发布单、真实站点清单：含站点资产信息
+local/
+*.local.json
+*.local.txt
+发布单*.txt
+
+# 凭据
+.env
+config.ps1
+*token*
+*secret*
+
+# ---- 运行产物 ----
+__pycache__/
+*.py[cod]
+*.csv
+*.log
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
