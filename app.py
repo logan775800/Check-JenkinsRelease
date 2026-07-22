@@ -128,6 +128,12 @@ def fetch_all_jobs(user, token_, force=False):
     return jobs
 
 
+def tz_label():
+    """当前进程时区，形如 'IST +0530'。页面上要显示出来 —— 否则用户拿它和
+    Jenkins 页面的时间对不上，会以为工具查错了（实际只是时区不同）。"""
+    return "%s %s" % (time.strftime("%Z"), time.strftime("%z"))
+
+
 def friendly_neterr(e):
     """把 Python 的网络异常翻译成能照着做的提示，别直接把 traceback 甩给用户。"""
     s = str(getattr(e, "reason", e))
@@ -436,7 +442,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
     return {"ok": True, "source": src, "date": date_str, "days": days,
             "sites": sites, "unknown": unknown, "components": comps,
             "rows": rows, "summary": summary, "warnings": warns,
-            "cachedAt": cached_at(user)}
+            "tz": tz_label(), "cachedAt": cached_at(user)}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -535,7 +541,7 @@ td a{color:inherit}
     ThirdApi:       →   分支:  uat
     ThirdJob:       →   分支:  uat"></textarea>
   <div class="ctl">
-    <div class="f"><label>发版日期</label><input type="date" id="date"></div>
+    <div class="f"><label>发版日期 <span id="tzhint" style="opacity:.75"></span></label><input type="date" id="date"></div>
     <div class="f"><label>往后几天</label><input type="number" id="days" value="1" min="1" max="30" style="width:76px"></div>
     <div class="f"><label>排除站点（逗号分隔）</label><input type="text" id="ex" value="AR000"></div>
     <div class="f chk"><input type="checkbox" id="all"><label for="all">忽略站点清单，核对全部站点</label></div>
@@ -549,6 +555,8 @@ td a{color:inherit}
 <script>
 const $=i=>document.getElementById(i);
 const LABEL={OK:'已发布',MISS:'未发布',FAIL:'构建失败',VER:'版本不符',RUN:'构建中',NOJOB:'无此任务'};
+// 默认日期由服务端给（见 /api/config）。别用浏览器本地日期 —— 时间窗是按服务端时区切的，
+// 浏览器在 UTC+8、容器在 UTC+5:30 的话会差一天。拿不到时才回落到浏览器日期。
 $('date').value=new Date().toLocaleDateString('sv');   // sv locale 天然是 YYYY-MM-DD
 
 // ---- 凭据：只放 sessionStorage，不落 localStorage，关标签页即失效 ----
@@ -568,6 +576,8 @@ $('clearcred').onclick=()=>{sessionStorage.removeItem(CK);sessionStorage.removeI
 
 fetch('/api/config').then(r=>r.json()).then(cfg=>{
   if(cfg.needCreds){$('credcard').style.display='';paintCred();}
+  if(cfg.today){$('date').value=cfg.today;}
+  if(cfg.tz){$('tzhint').textContent='时间按 '+cfg.tz+' 显示';}
   if(cfg.jenkinsUrl){
     $('tokenlink').innerHTML=' <a href="'+esc(cfg.jenkinsUrl)+'/me/security/" target="_blank">去生成 Token →</a>';
   }
@@ -613,7 +623,7 @@ function render(d){
     h+='<span class="pill '+k+'">'+LABEL[k]+' '+d.summary[k]+'</span>';});
   h+='</div><div class="sub" style="margin:0">站点来源：'+esc(d.source)+' · '+d.sites.length+
      ' 个站点 × '+d.components.length+' 个组件 · 时间窗 '+esc(d.date)+
-     (d.days>1?' 起 '+d.days+' 天':'')+' · 数据快照 '+esc(d.cachedAt)+'</div></div>';
+     (d.days>1?' 起 '+d.days+' 天':'')+' · 数据快照 '+esc(d.cachedAt)+(d.tz?' ('+esc(d.tz)+')':'')+'</div></div>';
 
   const bad=d.rows.filter(r=>BAD.includes(r.state));
   if(bad.length){
@@ -720,10 +730,14 @@ class Handler(BaseHTTPRequestHandler):
         if p in ("/", "/index.html"):
             self._send(200, PAGE, "text/html")
         elif p == "/api/config":
-            # 前端据此决定要不要显示「填写自己的 Jenkins 凭据」表单
+            # 前端据此决定要不要显示「填写自己的 Jenkins 凭据」表单。
+            # today/tz 也由服务端给：时间窗是按服务端时区切的，若用浏览器本地日期当默认值，
+            # 两边时区不同就会差一天（比如浏览器 UTC+8、容器 UTC+5:30）。
             self._send(200, json.dumps({
                 "jenkinsUrl": JENKINS_URL,
                 "needCreds": not (ALLOW_SERVER_CREDS and JENKINS_USER and JENKINS_TOKEN),
+                "today": datetime.now().strftime("%Y-%m-%d"),
+                "tz": tz_label(),
             }, ensure_ascii=False), "application/json")
         elif p == "/healthz":
             self._send(200, "ok", "text/plain")

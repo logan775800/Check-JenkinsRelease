@@ -21,6 +21,9 @@ services:
       # 容器内固定听 0.0.0.0；实际对外暴露范围由下面的 ports 绑定决定
       JENKINS_WEB_HOST: "0.0.0.0"
       JENKINS_WEB_PORT: "8770"
+      # 时区必须和 Jenkins 服务器一致，否则「今天」这个时间窗会错位、页面时间也对不上
+      # Jenkins 页面显示的时间 - UTC = 几小时，就填对应的时区。在 .env 里改。
+      TZ: "${TZ:-UTC}"
 
     ports:
       # 只绑回环：外部经宿主机的 nginx 反代进来，容器不直接暴露到公网。
