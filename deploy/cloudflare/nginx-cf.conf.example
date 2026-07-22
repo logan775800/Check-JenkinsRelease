@@ -1,0 +1,64 @@
+# 方案 B：开 80/443 + nginx，Cloudflare 代理回源（橙云）
+#
+# 只有在不能用 Cloudflare Tunnel 时才走这条。缺点：
+#   - 服务器必须对公网开 443，真实 IP 一旦泄露（历史 DNS、邮件头、其他服务）就能被绕过 CF 直连
+#   - 要自己管证书
+#
+# 放 /etc/nginx/conf.d/jenkins-check.conf
+#
+# 前置步骤：
+#   1. Cloudflare DNS 加 A 记录 jc -> 服务器IP，橙云（Proxied）
+#   2. SSL/TLS 模式必须选 Full (strict)。
+#      千万别用 Flexible —— 那样 CF 到你服务器这一段是明文 HTTP，
+#      浏览器地址栏是绿锁但实际半程裸奔。
+#   3. 生成 Cloudflare Origin Certificate（SSL/TLS → Origin Server → Create Certificate，
+#      有效期可选 15 年，免费），把证书和私钥存到下面两个路径
+#   4. 生成 CF IP 白名单：bash deploy/cloudflare/gen-cf-allow.sh
+#   5. nginx -t && systemctl reload nginx
+
+# 恢复访客真实 IP（否则日志里全是 Cloudflare 的 IP）
+include /etc/nginx/conf.d/cloudflare-real-ip.conf;
+
+server {
+    listen 80;
+    server_name jc.logan775800.top;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;                      # nginx < 1.25 用：listen 443 ssl http2;
+    server_name jc.logan775800.top;
+
+    ssl_certificate     /etc/pki/tls/certs/cf-origin.pem;
+    ssl_certificate_key /etc/pki/tls/private/cf-origin.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # 只允许 Cloudflare 边缘回源，挡掉直连真实 IP 的请求
+    include /etc/nginx/conf.d/cloudflare-allow.conf;
+    deny all;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy no-referrer always;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8770;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # 首次查询要拉几百个 job 的构建历史，几十秒起步
+        proxy_connect_timeout 30s;
+        proxy_send_timeout    300s;
+        proxy_read_timeout    300s;
+    }
+
+    location /healthz {
+        proxy_pass http://127.0.0.1:8770/healthz;
+        access_log off;
+    }
+}

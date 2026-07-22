@@ -218,10 +218,19 @@ journalctl -u check-jenkins-release -f
 
 ### 加域名 / HTTPS
 
-见 `deploy/nginx.conf.example`。配了反代之后记得把 `JENKINS_WEB_HOST` 改回 `127.0.0.1`
-并关掉防火墙上的 8770，让流量只能经 nginx 进来。
+**纯内网**：用 `deploy/nginx.conf.example`（带内网网段白名单），配完把
+`JENKINS_WEB_HOST` 改回 `127.0.0.1` 并关掉防火墙上的 8770。
 
-**这是发版数据，放内网，别开公网。** 示例配置里带了内网网段白名单。
+**用 Cloudflare 托管**：见 [`deploy/cloudflare/README.md`](deploy/cloudflare/README.md)。
+推荐 Cloudflare Tunnel —— 服务器一个入站端口都不用开：
+
+```bash
+bash deploy/cloudflare/install-cloudflared.sh jc.你的域名
+```
+
+⚠️ **加了公网域名之后，必须再配 Cloudflare Access**（Zero Trust → Access → Applications，
+50 人以内免费），否则这个地址任何人都能打开。页面本身要求填各自的 Jenkins Token 才能查数据，
+但「谁能打开这个页面」是另一层，得由 Access 来管。
 
 ### 更新
 
