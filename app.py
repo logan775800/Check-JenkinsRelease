@@ -23,15 +23,30 @@ import ssl
 import sys
 import time
 import urllib.error
+import socketserver
+import threading
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-JENKINS_URL = os.environ.get("JENKINS_URL", "https://your-jenkins-host").rstrip("/")
+# ThreadingHTTPServer 是 Python 3.7 才有的。CentOS 7.9 自带 python3 是 3.6.8，
+# 直接 import 会 ImportError，所以退回自己拼 ThreadingMixIn（等价实现）。
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+JENKINS_URL = os.environ.get("JENKINS_URL", "").rstrip("/")
 JENKINS_USER = os.environ.get("JENKINS_USER", "")
 JENKINS_TOKEN = os.environ.get("JENKINS_API_TOKEN", "")
 PORT = int(os.environ.get("JENKINS_WEB_PORT", "8770"))
+# 监听地址。默认只听回环；要给别人访问必须显式设成 0.0.0.0，顺带强制你想一下认证问题。
+HOST = os.environ.get("JENKINS_WEB_HOST", "127.0.0.1")
+# 是否允许用服务端环境变量里的凭据。本机自用=1；部署到服务器务必设 0，
+# 否则所有访问者都在用部署者的 Token 查数据，等于绕过 Jenkins 权限。
+ALLOW_SERVER_CREDS = os.environ.get("JENKINS_ALLOW_SERVER_CREDS", "1") == "1"
 MAX_BUILDS_PER_JOB = int(os.environ.get("JENKINS_MAX_BUILDS", "30"))
 CACHE_TTL = 60  # 秒。同一次发版核对往往要连点几次，缓存一分钟避免反复拉全量
 
@@ -64,14 +79,16 @@ COMPONENT_VIEW = {
 # 发布单里会出现、但不在这套 AR 命名的 Jenkins 上的组件
 NOT_IN_JENKINS = {"admin", "sitadmin", "后台", "后台管理"}
 
-_cache = {"ts": 0.0, "jobs": None}
+# 缓存按「用户」分桶：不同人的 Jenkins 权限不同，看到的 job 集合也不同，不能共用一份。
+_cache = {}
+_cache_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------- Jenkins 访问
-def jenkins_get(path):
+def jenkins_get(path, user, token_):
     url = JENKINS_URL + path
     req = urllib.request.Request(url)
-    token = base64.b64encode(f"{JENKINS_USER}:{JENKINS_TOKEN}".encode("ascii")).decode("ascii")
+    token = base64.b64encode(f"{user}:{token_}".encode("ascii")).decode("ascii")
     req.add_header("Authorization", "Basic " + token)
     # 站点前面有 WAF，会按 User-Agent 拦截：python-urllib 的默认 UA 直接 403，必须伪装成浏览器
     req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JenkinsReleaseCheck/1.0")
@@ -83,21 +100,28 @@ def jenkins_get(path):
         return json.loads(r.read().decode("utf-8"))
 
 
-def fetch_all_jobs(force=False):
+def fetch_all_jobs(user, token_, force=False):
     """拉全部 job 及其最近 N 次构建。一次请求拿完，别按视图拉（同 job 挂多视图会重复）。"""
     now = time.time()
-    if not force and _cache["jobs"] is not None and now - _cache["ts"] < CACHE_TTL:
-        return _cache["jobs"]
+    with _cache_lock:
+        hit = _cache.get(user)
+        if not force and hit and now - hit["ts"] < CACHE_TTL:
+            return hit["jobs"]
     tree = (
         "jobs[name,url,builds[number,result,building,timestamp,duration,url,actions["
         "parameters[name,value],lastBuiltRevision[SHA1,branch[name,SHA1]],"
         "causes[userName,shortDescription]]]{0,%d}]" % MAX_BUILDS_PER_JOB
     )
-    data = jenkins_get("/api/json?tree=" + urllib.parse.quote(tree, safe="[]{},"))
+    data = jenkins_get("/api/json?tree=" + urllib.parse.quote(tree, safe="[]{},"), user, token_)
     jobs = data.get("jobs", []) or []
-    _cache["jobs"] = jobs
-    _cache["ts"] = now
+    with _cache_lock:
+        _cache[user] = {"ts": now, "jobs": jobs}
     return jobs
+
+
+def cached_at(user):
+    hit = _cache.get(user)
+    return datetime.fromtimestamp(hit["ts"]).strftime("%H:%M:%S") if hit else ""
 
 
 # ---------------------------------------------------------------- 解析与判定
@@ -274,8 +298,8 @@ def read_build(b):
     }
 
 
-def run_check(text, date_str, days, exclude, all_sites, force):
-    jobs = fetch_all_jobs(force=force)
+def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
+    jobs = fetch_all_jobs(user, token_, force=force)
     comps, warns = parse_components(text)
     sites = parse_sites(text)
     site_group = parse_groups(text)      # {站点: 分组}，无分组时为 ''
@@ -379,7 +403,7 @@ def run_check(text, date_str, days, exclude, all_sites, force):
     return {"ok": True, "source": src, "date": date_str, "days": days,
             "sites": sites, "unknown": unknown, "components": comps,
             "rows": rows, "summary": summary, "warnings": warns,
-            "cachedAt": datetime.fromtimestamp(_cache["ts"]).strftime("%H:%M:%S")}
+            "cachedAt": cached_at(user)}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -447,6 +471,21 @@ td a{color:inherit}
 <h1>Jenkins 发版核对</h1>
 <div class="sub">把发布单整段复制粘进来 → 点「开始检查」。站点编号和组件 tag 都自动解析，只读不触发构建。</div>
 
+<div class="card" id="credcard" style="display:none">
+  <div class="sub" style="margin:0 0 10px">
+    用你自己的 Jenkins 账号查询 —— 看得到什么由你在 Jenkins 里的权限决定。
+    凭据只存在本浏览器标签页（sessionStorage），关掉即失效，服务器不保存。
+    <span id="tokenlink"></span>
+  </div>
+  <div class="ctl" style="margin:0">
+    <div class="f"><label>Jenkins 用户名</label><input type="text" id="ju" placeholder="登录名，不是邮箱"></div>
+    <div class="f"><label>API Token</label><input type="password" id="jt" placeholder="在 /me/security/ 生成"></div>
+    <div class="f"><button id="savecred">保存</button></div>
+    <div class="f"><button id="clearcred" class="sec">清除</button></div>
+    <div class="f"><span id="credstate" class="sub" style="margin:0;padding-bottom:8px"></span></div>
+  </div>
+</div>
+
 <div class="card">
   <textarea id="txt" placeholder="把发布单整段粘贴到这里，例如：
 
@@ -479,16 +518,45 @@ const $=i=>document.getElementById(i);
 const LABEL={OK:'已发布',MISS:'未发布',FAIL:'构建失败',VER:'版本不符',RUN:'构建中',NOJOB:'无此任务'};
 $('date').value=new Date().toLocaleDateString('sv');   // sv locale 天然是 YYYY-MM-DD
 
+// ---- 凭据：只放 sessionStorage，不落 localStorage，关标签页即失效 ----
+const CK='jrc_user',TK='jrc_token';
+function creds(){return {u:sessionStorage.getItem(CK)||'',t:sessionStorage.getItem(TK)||''};}
+function paintCred(){
+  const c=creds();
+  $('credstate').textContent=c.u&&c.t?('当前：'+c.u):'未填写';
+  $('ju').value=c.u;
+}
+$('savecred').onclick=()=>{
+  const u=$('ju').value.trim(),t=$('jt').value.trim();
+  if(!u||!t){alert('用户名和 Token 都要填');return;}
+  sessionStorage.setItem(CK,u);sessionStorage.setItem(TK,t);$('jt').value='';paintCred();
+};
+$('clearcred').onclick=()=>{sessionStorage.removeItem(CK);sessionStorage.removeItem(TK);$('jt').value='';paintCred();};
+
+fetch('/api/config').then(r=>r.json()).then(cfg=>{
+  if(cfg.needCreds){$('credcard').style.display='';paintCred();}
+  if(cfg.jenkinsUrl){
+    $('tokenlink').innerHTML=' <a href="'+esc(cfg.jenkinsUrl)+'/me/security/" target="_blank">去生成 Token →</a>';
+  }
+}).catch(()=>{});
+
 async function check(force){
   const t=$('txt').value.trim();
   if(!t){$('out').innerHTML='<div class="card empty">先把发布单粘贴到上面的文本框</div>';return;}
   $('go').disabled=true;$('go').textContent='检查中…';
   try{
-    const r=await fetch('/api/check',{method:'POST',headers:{'Content-Type':'application/json'},
+    const c=creds();
+    const hdr={'Content-Type':'application/json'};
+    if(c.u&&c.t){hdr['X-Jenkins-User']=c.u;hdr['X-Jenkins-Token']=c.t;}
+    const r=await fetch('/api/check',{method:'POST',headers:hdr,
       body:JSON.stringify({text:t,date:$('date').value,days:+$('days').value,
         exclude:$('ex').value.split(/[,，\s]+/),all:$('all').checked,force:!!force})});
     const d=await r.json();
-    if(d.error){$('out').innerHTML='<div class="card warn">出错：'+esc(d.error)+'</div>';return;}
+    if(d.error){
+      $('out').innerHTML='<div class="card warn">出错：'+esc(d.error)+'</div>';
+      if(d.needCreds){$('credcard').style.display='';$('credcard').scrollIntoView({behavior:'smooth'});}
+      return;
+    }
     render(d);
   }catch(e){$('out').innerHTML='<div class="card warn">请求失败：'+esc(e.message)+'</div>';}
   finally{$('go').disabled=false;$('go').textContent='开始检查';}
@@ -599,9 +667,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def creds(self):
+        """
+        取本次请求使用的 Jenkins 凭据。
+        多用户部署时每个人在网页上填自己的用户名 + Token，随请求头带上来，服务端不落盘；
+        这样「谁能看到什么」直接由 Jenkins 自身权限决定，不需要另做一套账号体系。
+        本机自用时可以回落到服务端环境变量（JENKINS_ALLOW_SERVER_CREDS=1）。
+        """
+        u = (self.headers.get("X-Jenkins-User") or "").strip()
+        t = (self.headers.get("X-Jenkins-Token") or "").strip()
+        if u and t:
+            return u, t
+        if ALLOW_SERVER_CREDS and JENKINS_USER and JENKINS_TOKEN:
+            return JENKINS_USER, JENKINS_TOKEN
+        return "", ""
+
     def do_GET(self):
-        if self.path.split("?")[0] in ("/", "/index.html"):
+        p = self.path.split("?")[0]
+        if p in ("/", "/index.html"):
             self._send(200, PAGE, "text/html")
+        elif p == "/api/config":
+            # 前端据此决定要不要显示「填写自己的 Jenkins 凭据」表单
+            self._send(200, json.dumps({
+                "jenkinsUrl": JENKINS_URL,
+                "needCreds": not (ALLOW_SERVER_CREDS and JENKINS_USER and JENKINS_TOKEN),
+            }, ensure_ascii=False), "application/json")
+        elif p == "/healthz":
+            self._send(200, "ok", "text/plain")
         else:
             self._send(404, "not found", "text/plain")
 
@@ -610,6 +702,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}), "application/json")
             return
         try:
+            if not JENKINS_URL:
+                raise RuntimeError("服务端没配 JENKINS_URL")
+            user, token_ = self.creds()
+            if not user or not token_:
+                self._send(200, json.dumps(
+                    {"error": "请先在页面右上角填写你自己的 Jenkins 用户名和 API Token", "needCreds": True},
+                    ensure_ascii=False), "application/json")
+                return
             n = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(n).decode("utf-8"))
             res = run_check(
@@ -619,25 +719,34 @@ class Handler(BaseHTTPRequestHandler):
                 req.get("exclude") or [],
                 bool(req.get("all")),
                 bool(req.get("force")),
+                user, token_,
             )
             self._send(200, json.dumps(res, ensure_ascii=False), "application/json")
         except urllib.error.HTTPError as e:
-            msg = f"Jenkins 返回 HTTP {e.code}" + ("（认证失败，检查 JENKINS_USER / JENKINS_API_TOKEN）" if e.code in (401, 403) else "")
+            msg = "Jenkins 返回 HTTP %d" % e.code
+            if e.code in (401, 403):
+                msg += "（认证失败：用户名或 API Token 不对）"
+                self._send(200, json.dumps({"error": msg, "needCreds": True}, ensure_ascii=False), "application/json")
+                return
             self._send(200, json.dumps({"error": msg}, ensure_ascii=False), "application/json")
         except Exception as e:
-            self._send(200, json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False), "application/json")
+            self._send(200, json.dumps({"error": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False), "application/json")
 
 
 def main():
-    if not JENKINS_USER or not JENKINS_TOKEN:
-        print("缺认证。先设置环境变量：")
-        print("  $env:JENKINS_USER='登录名'")
-        print("  $env:JENKINS_API_TOKEN='APIToken'   # 在 %s/me/security/ 生成" % JENKINS_URL)
+    if not JENKINS_URL:
+        print("缺 JENKINS_URL。设置环境变量后重试，例如：")
+        print("  export JENKINS_URL='https://jenkins.example.com'")
         sys.exit(1)
-    # 只监听 127.0.0.1：Token 在本机，别把这个口暴露到局域网/公网
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print("Jenkins : %s  (用户 %s)" % (JENKINS_URL, JENKINS_USER))
-    print("网页已启动: http://127.0.0.1:%d   按 Ctrl+C 停止" % PORT)
+    if HOST not in ("127.0.0.1", "localhost", "::1") and ALLOW_SERVER_CREDS and JENKINS_USER:
+        # 对外监听 + 用服务端凭据 = 谁访问都在用部署者的 Token，等于绕过 Jenkins 权限
+        print("!! 危险配置：监听 %s 的同时启用了服务端凭据。" % HOST)
+        print("!! 任何能访问该端口的人都会以 %s 的身份查询 Jenkins。" % JENKINS_USER)
+        print("!! 部署到服务器请设置 JENKINS_ALLOW_SERVER_CREDS=0，让每个人填自己的 Token。")
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    print("Jenkins  : %s" % JENKINS_URL)
+    print("凭据模式 : %s" % ("服务端共用（仅限本机自用）" if (ALLOW_SERVER_CREDS and JENKINS_USER) else "每人填自己的 Token"))
+    print("已启动   : http://%s:%d   Ctrl+C 停止" % (HOST, PORT))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

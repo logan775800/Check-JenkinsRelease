@@ -165,13 +165,68 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 - 网页版**只监听 `127.0.0.1`**：后端持 Token 转发，Token 不出本机。
 - `local/` 已在 `.gitignore` 里 —— 真实发布单、真实站点清单放这儿，不会入库。
 
-### 要部署到服务器给团队用
+### 凭据的两种模式
 
-现在这版**不能直接放服务器**，按顺序补三件事：
+| 模式 | `JENKINS_ALLOW_SERVER_CREDS` | 谁的 Token | 适用 |
+|---|---|---|---|
+| 本机自用 | `1`（默认） | 服务端环境变量里那份 | 自己电脑上跑 |
+| 多用户 | `0` | 每个人在网页上填自己的 | **部署到服务器必须用这个** |
 
-1. **加登录。** 现在任何能访问该端口的人，都在用部署者的 Token 查数据，等于绕过 Jenkins 权限。
-   建议改成「每个人填自己的 Token」（存浏览器 sessionStorage，后端不落盘）。
-2. **放内网，别放公网。** 这是发版数据。
-3. **反代 + HTTPS。** nginx 转发到 `127.0.0.1:8770`，配证书；同时把监听地址保持在回环。
+多用户模式下，凭据只存在使用者浏览器的 `sessionStorage`（关标签页即失效），
+随请求头 `X-Jenkins-User` / `X-Jenkins-Token` 传给后端，**服务器不保存、不落盘**。
 
-在补齐 1 之前，本机自己用是最安全的。
+这样不用另做一套账号体系：**谁能看到什么，直接由他自己在 Jenkins 里的权限决定。**
+
+监听地址默认 `127.0.0.1`。要给别人访问必须显式设 `JENKINS_WEB_HOST=0.0.0.0` ——
+故意做成显式的，顺带强制你想一下认证问题。若在对外监听的同时还开着服务端凭据，
+启动时会打印醒目告警。
+
+---
+
+## 部署到 CentOS 7.9
+
+```bash
+git clone https://github.com/logan775800/Check-JenkinsRelease.git
+cd Check-JenkinsRelease
+bash deploy/install.sh https://你的jenkins地址
+```
+
+脚本做的事：建无登录权限的运行用户 `jenkinscheck` → 装到 `/opt/check-jenkins-release`
+→ 写 `/etc/check-jenkins-release.env`（`chmod 600`）→ 装 systemd 服务并开机自启
+→ firewalld 放行端口 → 健康检查。
+
+装完：
+
+```bash
+systemctl status check-jenkins-release
+journalctl -u check-jenkins-release -f
+```
+
+浏览器开 `http://<服务器IP>:8770`，每个人首次使用填一次自己的 Jenkins 用户名 + API Token。
+
+### CentOS 7.9 的两个坑
+
+1. **自带 python3 是 3.6.8**，没有 `ThreadingHTTPServer`（3.7 才有）。
+   代码里已做兼容回退（`ThreadingMixIn + HTTPServer`），**不需要装新版 Python**。
+2. **CentOS 7 已 EOL**，官方 yum 源下线，`yum install python3` 可能失败。
+   先切 vault 源（install.sh 检测到失败会把命令打出来）：
+   ```bash
+   sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-*.repo
+   sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo
+   yum clean all && yum makecache && yum install -y python3
+   ```
+
+### 加域名 / HTTPS
+
+见 `deploy/nginx.conf.example`。配了反代之后记得把 `JENKINS_WEB_HOST` 改回 `127.0.0.1`
+并关掉防火墙上的 8770，让流量只能经 nginx 进来。
+
+**这是发版数据，放内网，别开公网。** 示例配置里带了内网网段白名单。
+
+### 更新
+
+```bash
+cd Check-JenkinsRelease && git pull
+install -m 0644 app.py /opt/check-jenkins-release/app.py
+systemctl restart check-jenkins-release
+```

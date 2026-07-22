@@ -1,0 +1,42 @@
+# 可选：加 HTTPS + 域名。放 /etc/nginx/conf.d/jenkins-check.conf
+#
+# 配了 nginx 之后，把 /etc/check-jenkins-release.env 里的
+#     JENKINS_WEB_HOST=0.0.0.0
+# 改回
+#     JENKINS_WEB_HOST=127.0.0.1
+# 让应用只听回环，外部只能经 nginx 进来；同时关掉防火墙上的 8770：
+#     firewall-cmd --permanent --remove-port=8770/tcp && firewall-cmd --reload
+
+server {
+    listen 80;
+    server_name jenkins-check.example.com;
+    # 有证书就把上面这段换成 443 + ssl，并加一条 80 -> 443 跳转
+    # listen 443 ssl;
+    # ssl_certificate     /etc/pki/tls/certs/your.crt;
+    # ssl_certificate_key /etc/pki/tls/private/your.key;
+
+    # 这是发版数据，别开到公网。限制来源网段：
+    allow 10.0.0.0/8;
+    allow 172.16.0.0/12;
+    allow 192.168.0.0/16;
+    deny  all;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8770;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # 首次查询要拉全部 job 的构建历史，几百个 job 可能要几十秒
+        proxy_connect_timeout 30s;
+        proxy_send_timeout    300s;
+        proxy_read_timeout    300s;
+    }
+
+    location /healthz {
+        proxy_pass http://127.0.0.1:8770/healthz;
+        access_log off;
+    }
+}
