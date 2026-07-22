@@ -235,7 +235,18 @@ openssl s_client -connect 你的jenkins:443 -servername 你的jenkins -tls1_2 </
    bash deploy/install-docker.sh https://你的jenkins地址
    ```
    容器只绑 `127.0.0.1:8770`，**nginx 配置不用改**。脚本会先在容器里试一次握手，
-   通了才启动，免得白折腾。
+   通了才启动，免得白折腾；同时自动停掉抢端口的 systemd 服务。
+
+   之后日常操作在仓库根目录用 compose 即可（`docker compose` 和 `docker-compose` 都兼容）：
+
+   ```bash
+   docker compose logs -f          # 看日志
+   docker compose restart          # 改完 .env 后重启
+   docker compose up -d --build    # git pull 之后更新
+   docker compose down             # 停
+   ```
+
+   配置在仓库根目录的 `.env`（从 `.env.example` 复制，已被 gitignore 忽略）。
 3. 升级宿主机 OpenSSL / Python —— CentOS 7 上很折腾，不推荐。
 
 ### CentOS 7.9 的另外两个坑

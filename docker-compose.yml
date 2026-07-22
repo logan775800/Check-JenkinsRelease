@@ -1,0 +1,41 @@
+# docker compose up -d
+#
+# 配置放同目录的 .env（已被 .gitignore 忽略），从 .env.example 复制一份改。
+#
+# 为什么要用容器：CentOS 7.9 自带 OpenSSL 1.0.2k，最高只到 TLS 1.2；
+# Jenkins 前面的 WAF 只收 TLS 1.3，宿主机上 python 和 curl 都握手失败。
+# 镜像自带 OpenSSL 3.x，换个壳就通了，不用动宿主机系统库。
+version: "3"
+
+services:
+  jenkins-check:
+    build: .
+    image: jenkins-check:latest
+    container_name: jenkins-check
+    restart: always
+
+    env_file:
+      - .env
+
+    environment:
+      # 容器内固定听 0.0.0.0；实际对外暴露范围由下面的 ports 绑定决定
+      JENKINS_WEB_HOST: "0.0.0.0"
+      JENKINS_WEB_PORT: "8770"
+
+    ports:
+      # 只绑回环：外部经宿主机的 nginx 反代进来，容器不直接暴露到公网。
+      # 想让局域网直接访问就把 127.0.0.1: 去掉（那样 nginx 就可以不要了）。
+      - "127.0.0.1:8770:8770"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8770/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
