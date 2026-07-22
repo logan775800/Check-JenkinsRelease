@@ -92,10 +92,19 @@ def jenkins_get(path, user, token_):
     req.add_header("Authorization", "Basic " + token)
     # 站点前面有 WAF，会按 User-Agent 拦截：python-urllib 的默认 UA 直接 403，必须伪装成浏览器
     req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JenkinsReleaseCheck/1.0")
-    ctx = ssl.create_default_context()
-    if os.environ.get("JENKINS_SKIP_CERT") == "1":
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    ctx = None
+    if url.lower().startswith("https"):
+        ctx = ssl.create_default_context()
+        # 显式抬到 TLS 1.2 起步。老系统（CentOS 7 的 OpenSSL 1.0.2）默认可能先试更低版本，
+        # 被强制 1.2+ 的对端直接回 alert，报错信息还很难懂。
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2   # Python 3.7+
+        except AttributeError:
+            ctx.options |= getattr(ssl, "OP_NO_SSLv2", 0) | getattr(ssl, "OP_NO_SSLv3", 0)
+            ctx.options |= getattr(ssl, "OP_NO_TLSv1", 0) | getattr(ssl, "OP_NO_TLSv1_1", 0)
+        if os.environ.get("JENKINS_SKIP_CERT") == "1":
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
     with urllib.request.urlopen(req, timeout=180, context=ctx) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -117,6 +126,30 @@ def fetch_all_jobs(user, token_, force=False):
     with _cache_lock:
         _cache[user] = {"ts": now, "jobs": jobs}
     return jobs
+
+
+def friendly_neterr(e):
+    """把 Python 的网络异常翻译成能照着做的提示，别直接把 traceback 甩给用户。"""
+    s = str(getattr(e, "reason", e))
+    ver = ssl.OPENSSL_VERSION
+    if "TLSV1_ALERT_PROTOCOL_VERSION" in s or "UNSUPPORTED_PROTOCOL" in s:
+        return (
+            "TLS 握手失败：对端拒绝了本机提供的 TLS 版本。"
+            "本机 OpenSSL 是「%s」—— 1.0.x 只支持到 TLS 1.2，若 Jenkins 前面的 WAF 强制 TLS 1.3 就会这样。"
+            "三种解法：① 若 Jenkins 就在本机，把 JENKINS_URL 改成 http://127.0.0.1:<Jenkins端口> 直连，绕开 TLS；"
+            "② 用 Docker 跑本服务（镜像自带新版 OpenSSL）；③ 升级本机 OpenSSL/Python。"
+            "详见 README「CentOS 7 的 TLS 限制」。原始错误：%s" % (ver, s)
+        )
+    if "CERTIFICATE_VERIFY_FAILED" in s:
+        return ("证书校验失败（自签证书或缺中间证书）。确认无误后可在配置里加 "
+                "JENKINS_SKIP_CERT=1 跳过校验。原始错误：%s" % s)
+    if "Name or service not known" in s or "nodename nor servname" in s:
+        return "DNS 解析不了 JENKINS_URL 里的主机名，检查地址是否写对、服务器能否解析该域名。原始错误：%s" % s
+    if "Connection refused" in s:
+        return "连接被拒绝：JENKINS_URL 的地址或端口不对，或该端口上没有服务。原始错误：%s" % s
+    if "timed out" in s.lower():
+        return "连接 Jenkins 超时：检查服务器到 Jenkins 的网络是否通（防火墙/安全组）。原始错误：%s" % s
+    return "连接 Jenkins 失败：%s" % s
 
 
 def cached_at(user):
@@ -729,6 +762,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"error": msg, "needCreds": True}, ensure_ascii=False), "application/json")
                 return
             self._send(200, json.dumps({"error": msg}, ensure_ascii=False), "application/json")
+        except urllib.error.URLError as e:
+            self._send(200, json.dumps({"error": friendly_neterr(e)}, ensure_ascii=False), "application/json")
         except Exception as e:
             self._send(200, json.dumps({"error": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False), "application/json")
 

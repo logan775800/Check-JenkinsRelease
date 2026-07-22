@@ -204,7 +204,41 @@ journalctl -u check-jenkins-release -f
 
 浏览器开 `http://<服务器IP>:8770`，每个人首次使用填一次自己的 Jenkins 用户名 + API Token。
 
-### CentOS 7.9 的两个坑
+### CentOS 7 的 TLS 限制（可能直接卡住你）
+
+CentOS 7.9 自带 **OpenSSL 1.0.2k，最高只到 TLS 1.2**。如果你的 Jenkins 前面有
+WAF/CDN 且只接受 TLS 1.3，宿主机上无论 Python 还是 curl 都握手失败：
+
+```
+URLError: [SSL: TLSV1_ALERT_PROTOCOL_VERSION] tlsv1 alert protocol version
+curl: (35) Peer reports incompatible or unsupported protocol version
+```
+
+一分钟确认是不是这个问题：
+
+```bash
+openssl version                      # 1.0.x 就有嫌疑
+curl -sS -o /dev/null https://你的jenkins/api/json   # 报 (35) 即中招
+openssl s_client -connect 你的jenkins:443 -servername 你的jenkins -tls1_2 </dev/null 2>&1 | grep Cipher
+# 出现 "Cipher is (NONE)" = 对端拒绝了 TLS 1.2，只收 1.3
+```
+
+**解法（按省事程度）：**
+
+1. **Jenkins 就在本机** → 直连 HTTP 绕开 TLS，最省事：
+   ```bash
+   sed -i 's|^JENKINS_URL=.*|JENKINS_URL=http://127.0.0.1:8080|' /etc/check-jenkins-release.env
+   systemctl restart check-jenkins-release
+   ```
+2. **用 Docker 跑**（镜像自带 OpenSSL 3.x，支持 TLS 1.3），不动宿主机系统库：
+   ```bash
+   bash deploy/install-docker.sh https://你的jenkins地址
+   ```
+   容器只绑 `127.0.0.1:8770`，**nginx 配置不用改**。脚本会先在容器里试一次握手，
+   通了才启动，免得白折腾。
+3. 升级宿主机 OpenSSL / Python —— CentOS 7 上很折腾，不推荐。
+
+### CentOS 7.9 的另外两个坑
 
 1. **自带 python3 是 3.6.8**，没有 `ThreadingHTTPServer`（3.7 才有）。
    代码里已做兼容回退（`ThreadingMixIn + HTTPServer`），**不需要装新版 Python**。
