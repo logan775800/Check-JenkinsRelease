@@ -249,6 +249,44 @@ openssl s_client -connect 你的jenkins:443 -servername 你的jenkins -tls1_2 </
    配置在仓库根目录的 `.env`（从 `.env.example` 复制，已被 gitignore 忽略）。
 3. 升级宿主机 OpenSSL / Python —— CentOS 7 上很折腾，不推荐。
 
+### Jenkins 前面有 WAF：换台机器部署就 403
+
+同一个 Token 在自己电脑上好好的，部署到服务器就 `HTTP 403`。因为 WAF 是按**来源 IP**
+放行的，你的办公网在名单里，服务器不在。
+
+判断方法是看 403 的**响应头**（`friendly_neterr` 只能说明状态码，看不出是谁拒的）：
+
+```bash
+docker run --rm --env-file .env python:3.12-alpine python -c "
+import base64,os,urllib.request,urllib.error
+U,T=os.environ['JENKINS_USER'],os.environ['JENKINS_API_TOKEN']
+r=urllib.request.Request(os.environ['JENKINS_URL'].rstrip('/')+'/api/json?tree=views[name]')
+r.add_header('Authorization','Basic '+base64.b64encode(f'{U}:{T}'.encode()).decode())
+r.add_header('User-Agent','Mozilla/5.0')
+try:
+    print('OK', urllib.request.urlopen(r,timeout=30).status)
+except urllib.error.HTTPError as e:
+    print('HTTP',e.code); [print(' ',k,':',v) for k,v in e.headers.items()]
+"
+# 顺便拿服务器出口 IP
+docker run --rm python:3.12-alpine python -c "import urllib.request;print(urllib.request.urlopen('https://api.ipify.org',timeout=15).read().decode())"
+```
+
+| 响应头特征 | 结论 |
+|---|---|
+| `Server: cloudflare` + `CF-RAY` + `Attention Required!` | **Cloudflare WAF 在边缘拦的**，请求没到 Jenkins |
+| `X-Jenkins: 2.xxx` | Jenkins 本体回的 —— Authorization 头被中间设备剥了，被当成匿名 |
+
+Cloudflare 拦截的解法：控制台 → **Security → WAF → Tools → IP Access Rules**
+→ 添加服务器出口 IP，Action 选 **Allow**。
+若仍 403，说明是 **Custom rules** 里的规则在拦（IP Access Rules 覆盖不了它），
+需要在那条规则表达式里加 `and ip.src ne <服务器IP>`，或加一条 Skip 规则排在它前面。
+
+注意云服务器的出口 IP 要是**固定 EIP**，否则白名单会随 IP 变动失效。
+
+另外顺带一提：这个 WAF 通常也会按 User-Agent 拦 —— `python-urllib` 的默认 UA 直接 403，
+所以代码里固定伪装了浏览器 UA。
+
 ### CentOS 7.9 的另外两个坑
 
 1. **自带 python3 是 3.6.8**，没有 `ThreadingHTTPServer`（3.7 才有）。
