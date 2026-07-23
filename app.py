@@ -200,9 +200,17 @@ def parse_sites(text):
 
 
 def canon_group(s):
-    """分组名归一：去掉「站点/的/：」等修饰，「中台站点」->「中台」，「非中台站点」->「非中台」。"""
+    """
+    分组名归一。同一个分组在发布单里有多种写法，必须归到一起才能对上：
+        【发布站点】段写「中台站点」，【发布代码】段写「中台版本分支」，都要归成「中台」。
+    只剥尾缀，不动词头 —— 「非中台」不能被剥成「中台」。
+    """
     s = re.sub(r"[\s:：]+", "", (s or "").strip())
-    s = re.sub(r"(站点|站台|的)$", "", s)
+    for _ in range(4):   # 「中台版本分支」要连剥两次
+        new = re.sub(r"(站点|站台|版本|分支|标签|tag|的)$", "", s, flags=re.IGNORECASE)
+        if new == s:
+            break
+        s = new
     return s
 
 
@@ -232,66 +240,122 @@ def parse_groups(text):
     return groups
 
 
+# 值至少要含一个字母或数字。否则「web  tag：」这种「组件名占一行、值在下面」的写法，
+# 会让正则把行尾那个孤零零的冒号当成值，期望值变成「：」，于是所有站点全判「版本不符」。
+_VALUE_OK = re.compile(r"[0-9A-Za-z]")
+
+# 组件行：组件名 +（限定词）+ 箭头或 tag/分支 关键字 + 值。箭头和关键字至少要有一个，
+# 否则随便一行 "a: b" 都会被当成组件。组件名允许含空格（"Web Pages"）。
+_COMP_LINE = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9_\- 一-龥]+?)\s*"
+    r"[:：]?\s*"                       # 「ThirdApi:  →  分支: uat」组件名后面直接跟冒号
+    r"(?:[（(](?P<q1>[^）)]*)[）)])?\s*"
+    r"(?:(?P<arrow>→|->|=>|➔|⇒|➜)\s*)?"
+    r"(?:(?P<kw>tag|分支|branch|标签|tag名|分支名)\s*)?"
+    r"(?:[（(](?P<q2>[^）)]*)[）)])?\s*"
+    r"[:：]?\s*(?P<val>\S+)?\s*$",
+    re.IGNORECASE,
+)
+# 限定词行：出现在某个组件名下面，形如「非中台版本分支：main-3.04」「ar046（xx）：uat」
+_QUAL_LINE = re.compile(r"^\s*(?P<label>[^:：]+?)\s*[:：]\s*(?P<val>\S+)\s*$")
+
+
+def resolve_component(raw):
+    """发布单里的组件写法 -> Jenkins 组件名。返回 (组件名, 是否属于「不在这套 Jenkins」)。"""
+    key = canon(raw)
+    if not key:
+        return None, False
+    if key in NOT_IN_JENKINS:
+        return None, True
+    name = COMPONENT_ALIAS.get(key)
+    if not name:                       # 也允许直接写 Jenkins 里的组件名本身
+        for v in set(COMPONENT_ALIAS.values()):
+            if canon(v) == key:
+                name = v
+                break
+    return name, False
+
+
 def parse_components(text):
     """
-    从发布单【发布代码】段抠出 组件 -> 期望 tag/分支。识别形如：
-        LotteryApi    →    tag:   master_V3.08_001
-        web           →    分支:  masterBranch/main-3.04
-        ThirdApi:     ->   分支： uat
-    返回 (components, warnings)
+    从发布单【发布代码】段抠出 组件 -> 期望 tag/分支。三种写法都要吃下：
+
+      A) 一行写完：      LotteryApi  →  tag: master_V3.08_001
+      B) 一行带限定词：  web  tag（中台）: feature/v3
+      C) 组件名单独一行，下面按分组/站点列各自的分支：
+             web  tag：
+                 非中台版本分支：  masterBranch/main-3.04
+                 中台版本分支：    feature/v3
+                 ar046（代收手续费版本）： uat     <- 站点级特例
+
+    返回 (components, warnings)。component = {key,name,expect,raw,group,site}，
+    group 为空表示对所有站点生效；site 非空表示只对该站点生效（优先级高于 group）。
     """
     comps, warns, seen = [], [], set()
-    # 两种写法都要吃下：
-    #   有箭头： LotteryApi  →  tag: master_V3.08_001
-    #   无箭头： web  tag（非中台）: masterBranch/main-3.04
-    # 所以箭头和 tag/分支 关键字都是可选的，但至少得有一个（否则随便一行 a:b 都会被当组件）。
-    # 括号里的限定词（中台/非中台）表示这条只对该分组的站点生效。
-    # 组件名允许含空格（"Web Pages"），非贪婪 + 结尾锚定，否则空格写法整行失配 ——
-    # 那是最危险的情况：发布单里有这个组件，工具当没看见，报告还显示「全部通过」。
-    pat = re.compile(
-        r"^\s*(?P<name>[A-Za-z0-9_\- 一-龥]+?)\s*"
-        r"(?:[（(](?P<q1>[^）)]*)[）)])?\s*"
-        r"(?:(?P<arrow>→|->|=>|➔|⇒|➜)\s*)?"
-        r"(?:(?P<kw>tag|分支|branch|标签|tag名|分支名)\s*)?"
-        r"(?:[（(](?P<q2>[^）)]*)[）)])?\s*"
-        r"[:：]?\s*(?P<val>\S+)\s*$",
-        re.IGNORECASE,
-    )
-    for line in presplit(text).splitlines():
-        m = pat.match(line)
-        if not m:
-            continue
-        if not (m.group("arrow") or m.group("kw")):
-            continue  # 既没箭头也没 tag/分支 关键字，不是组件行
-        raw, expect = m.group("name").strip(), m.group("val").strip()
-        group = canon_group(m.group("q2") or m.group("q1") or "")
-        # 站点行「（国家）AR001→SiteA」也带箭头，会撞进来，按 AR 编号剔掉
-        if re.match(r"(?i)^\(?[^)]*\)?\s*AR\d", raw) or re.search(r"(?i)\bAR\d{2,4}\b", raw):
-            continue
-        key = canon(raw)
-        if not key:
-            continue
-        if key in NOT_IN_JENKINS:
-            warns.append(f"发布单里的「{raw} → {expect}」不在这套 Jenkins 上（属于另一套后台部署），本次未核对")
-            continue
-        name = COMPONENT_ALIAS.get(key)
-        if not name:
-            # 也允许直接写 Jenkins 里的组件名本身
-            for v in set(COMPONENT_ALIAS.values()):
-                if canon(v) == key:
-                    name = v
-                    break
-        if not name:
-            warns.append(f"不认识的组件名「{raw} → {expect}」，已跳过（未核对）。"
-                         f"可用：{', '.join(sorted(set(COMPONENT_ALIAS.values())))}")
-            continue
-        # 同一组件可以出现多次，只要分组不同（中台发 feature/v3、非中台发 main-3.04）
-        k = (name, group)
+    cur_comp = None      # C) 里「当前组件」
+    cur_raw = ""
+
+    def add(name, raw, expect, group="", site=""):
+        k = (name, group, site)
         if k in seen:
-            continue
+            return
         seen.add(k)
-        comps.append({"key": f"{name}@{group}", "name": name, "expect": expect,
-                      "raw": raw, "group": group})
+        comps.append({"key": "%s@%s@%s" % (name, group, site), "name": name,
+                      "expect": expect, "raw": raw, "group": group, "site": site})
+
+    for line in presplit(text).splitlines():
+        if not line.strip():
+            continue
+        m = _COMP_LINE.match(line)
+        if m:
+            raw = m.group("name").strip()
+            val = (m.group("val") or "").strip()
+            has_marker = bool(m.group("arrow") or m.group("kw"))
+            # 站点行「（国家）AR001→SiteA」也带箭头，会撞进来，按 AR 编号剔掉
+            is_site_line = bool(re.search(r"(?i)\bAR\d{2,4}\b", raw))
+            name, not_here = resolve_component(raw)
+
+            if not_here and has_marker:
+                warns.append(f"发布单里的「{raw} → {val}」不在这套 Jenkins 上"
+                             f"（属于另一套后台部署），本次未核对")
+                cur_comp = None
+                continue
+
+            if name and not is_site_line:
+                if val and _VALUE_OK.search(val):
+                    add(name, raw, val, canon_group(m.group("q2") or m.group("q1") or ""))
+                    cur_comp, cur_raw = name, raw   # 后面可能还跟着限定词行
+                else:
+                    # C) 组件名占一行、值在下面几行。这里不能当成组件行处理，
+                    # 否则会把行尾的冒号当成期望值。
+                    cur_comp, cur_raw = name, raw
+                continue
+
+            if has_marker and not name and not is_site_line and val and _VALUE_OK.search(val):
+                # 形似组件行但名字不认识。带箭头的一律当组件行告警；
+                # 不带箭头、且正处在某个组件下面的，才可能是限定词行（见下）。
+                # 不这么分的话「随便写个啥 → tag: v2」会被吞成上一个组件的分组，静默出错。
+                if cur_comp is None or m.group("arrow"):
+                    warns.append(f"不认识的组件名「{raw} → {val}」，已跳过（未核对）。"
+                                 f"可用：{', '.join(sorted(set(COMPONENT_ALIAS.values())))}")
+                    continue
+
+        # C) 限定词行：只有在「当前组件」已确定、且本行没有箭头时才解释，避免误吃正文
+        if cur_comp and not re.search(r"→|->|=>|➔|⇒|➜", line):
+            q = _QUAL_LINE.match(line)
+            if q:
+                label, val = q.group("label").strip(), q.group("val").strip()
+                if not _VALUE_OK.search(val):
+                    continue
+                if resolve_component(label)[0]:
+                    continue                      # 是组件名，交给上面处理
+                codes = parse_sites(label)
+                if codes:                          # ar046（代收手续费版本）： uat
+                    add(cur_comp, cur_raw, val, site=codes[0])
+                else:                              # 非中台版本分支： main-3.04
+                    g = canon_group(re.sub(r"[（(][^）)]*[）)]", "", label))
+                    if g:
+                        add(cur_comp, cur_raw, val, group=g)
     return comps, warns
 
 
@@ -391,19 +455,32 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
         if unmatched:
             warns.append("这些站点分组在发布代码里没有对应的分支说明，未核对：" + ", ".join(unmatched))
 
+    # 站点级特例（如「ar046（代收手续费版本）：uat」）优先级最高：
+    # 该站点只按特例那条核对，不再套用它所属分组的分支，否则会重复且互相矛盾。
+    override = {}
+    for c in comps:
+        if c.get("site"):
+            override.setdefault(c["name"], set()).add(c["site"])
+
     rows = []
     for c in comps:
         expect = normalize_ref(c["expect"])
-        comp_sites = [s for s in sites
-                      if not c["group"] or site_group.get(s, "") == c["group"]]
-        if c["group"] and not comp_sites:
-            warns.append(f"发布代码里写了「{c['raw']}（{c['group']}）」，但站点清单里没有「{c['group']}」分组的站点")
+        if c.get("site"):
+            comp_sites = [s for s in sites if s == c["site"]]
+            if not comp_sites:
+                warns.append(f"发布代码里给 {c['site']} 单独指定了分支，但站点清单里没有这个站点")
+        else:
+            comp_sites = [s for s in sites
+                          if (not c["group"] or site_group.get(s, "") == c["group"])
+                          and s not in override.get(c["name"], set())]
+            if c["group"] and not comp_sites:
+                warns.append(f"发布代码里写了「{c['raw']}（{c['group']}）」，但站点清单里没有「{c['group']}」分组的站点")
         for s in comp_sites:
             matched = [j for j in jobs
                        if re.match(r"^%s-%s(-|$)" % (re.escape(s), re.escape(c["name"])), j["name"])]
             if not matched:
                 rows.append({"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
-                             "group": c["group"], "view": COMPONENT_VIEW.get(c["name"], ""), "job": "",
+                             "group": c["group"], "onlySite": c.get("site",""), "view": COMPONENT_VIEW.get(c["name"], ""), "job": "",
                              "state": "NOJOB", "expect": c["expect"], "detail": "该站点没有这个任务"})
                 continue
             for j in matched:
@@ -414,7 +491,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                 # 用去掉「AR###-组件-」前缀后的剩余部分区分，否则色块长得一模一样
                 suffix = re.sub(r"^%s-%s-?" % (re.escape(s), re.escape(c["name"])), "", j["name"])
                 base = {"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
-                        "group": c["group"], "view": COMPONENT_VIEW.get(c["name"], ""), "job": j["name"],
+                        "group": c["group"], "onlySite": c.get("site",""), "view": COMPONENT_VIEW.get(c["name"], ""), "job": j["name"],
                         "jobSuffix": suffix if len(matched) > 1 else "", "expect": c["expect"]}
                 if not inwin:
                     rows.append(dict(base, state="MISS", detail="时间窗内没有构建", url=j.get("url", "")))
@@ -641,7 +718,7 @@ function render(d){
   d.components.forEach(c=>{
     let rows=d.rows.filter(r=>r.compKey===c.key);
     if(only)rows=rows.filter(r=>BAD.includes(r.state));
-    h+='<h2>'+esc(c.name)+(c.group?' <span class=\"pill VER\" style=\"font-size:12px\">'+esc(c.group)+'</span>':'')+' <span class=\"tag\">视图 '+esc(d.rows.find(r=>r.compKey===c.key)?.view||'')+
+    h+='<h2>'+esc(c.name)+(c.group?' <span class=\"pill VER\" style=\"font-size:12px\">'+esc(c.group)+'</span>':'')+(c.site?' <span class=\"pill RUN\" style=\"font-size:12px\">仅 '+esc(c.site)+'</span>':'')+' <span class=\"tag\">视图 '+esc(d.rows.find(r=>r.compKey===c.key)?.view||'')+
        ' · 发布单写的是「'+esc(c.raw)+'」 · 期望 '+esc(c.expect)+'</span></h2>';
     if(!rows.length){h+='<div class="sub" style="margin:6px 0 0">'+(only?'该组件全部通过':'无数据')+'</div>';return;}
     // 分支名相同不等于代码相同：期间有人往分支推了新提交，先发的站点就落后了。
