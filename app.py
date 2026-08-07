@@ -27,6 +27,7 @@ import socketserver
 import threading
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -48,7 +49,14 @@ HOST = os.environ.get("JENKINS_WEB_HOST", "127.0.0.1")
 # 否则所有访问者都在用部署者的 Token 查数据，等于绕过 Jenkins 权限。
 ALLOW_SERVER_CREDS = os.environ.get("JENKINS_ALLOW_SERVER_CREDS", "1") == "1"
 MAX_BUILDS_PER_JOB = int(os.environ.get("JENKINS_MAX_BUILDS", "30"))
-CACHE_TTL = 60  # 秒。同一次发版核对往往要连点几次，缓存一分钟避免反复拉全量
+CACHE_TTL = int(os.environ.get("JENKINS_CACHE_TTL", "60"))  # 秒。一次核对往往连点几次，缓存避免反复拉
+# 按需拉构建历史时的并发数。Jenkins 前面有 Cloudflare WAF，并发开太大会被限速，
+# 6 是实测下来既明显加速又不触发限速的值。见 README「Jenkins 前面有 WAF」。
+FETCH_CONCURRENCY = max(1, int(os.environ.get("JENKINS_FETCH_CONCURRENCY", "6")))
+# 需要拉的 job 超过这个数就改用「一次性全量」那条老路：几百个短请求穿 WAF
+# 比一个大请求更容易被限速，而且到了这个量级两者耗时也差不多了。
+BULK_THRESHOLD = int(os.environ.get("JENKINS_BULK_THRESHOLD", "200"))
+MAX_BODY = 2 * 1024 * 1024  # /api/check 请求体上限。发布单再长也就几十 KB
 
 # job 命名规约：AR{编号}-{组件}-{国家}-{站点名}
 # 发布单里写的组件名和 Jenkins 里的组件名对不上，这里做别名映射。
@@ -80,12 +88,29 @@ COMPONENT_VIEW = {
 NOT_IN_JENKINS = {"admin", "sitadmin", "后台", "后台管理"}
 
 # 缓存按「用户」分桶：不同人的 Jenkins 权限不同，看到的 job 集合也不同，不能共用一份。
+# 每桶两部分：names = job 清单（便宜，一次拉全）；builds = 按 job 名分开存的构建历史（贵，按需拉）。
 _cache = {}
 _cache_lock = threading.Lock()
+# 同一份数据的并发请求只让一个真去打 Jenkins，其余等它拉完直接用结果。
+# 不这么做的话，缓存冷的时候连点两下「开始检查」会同时拉两遍全量。
+_locks = {}
+
+
+def _bucket(user):
+    with _cache_lock:
+        return _cache.setdefault(user, {"names": None, "builds": {}})
+
+
+def _lock_for(key):
+    with _cache_lock:
+        lk = _locks.get(key)
+        if lk is None:
+            lk = _locks[key] = threading.Lock()
+        return lk
 
 
 # ---------------------------------------------------------------- Jenkins 访问
-def jenkins_get(path, user, token_):
+def jenkins_get(path, user, token_, timeout=180):
     url = JENKINS_URL + path
     req = urllib.request.Request(url)
     token = base64.b64encode(f"{user}:{token_}".encode("ascii")).decode("ascii")
@@ -105,27 +130,137 @@ def jenkins_get(path, user, token_):
         if os.environ.get("JENKINS_SKIP_CERT") == "1":
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=180, context=ctx) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-def fetch_all_jobs(user, token_, force=False):
-    """拉全部 job 及其最近 N 次构建。一次请求拿完，别按视图拉（同 job 挂多视图会重复）。"""
-    now = time.time()
-    with _cache_lock:
-        hit = _cache.get(user)
-        if not force and hit and now - hit["ts"] < CACHE_TTL:
+def _q(tree):
+    return "?tree=" + urllib.parse.quote(tree, safe="[]{},")
+
+
+_BUILD_FIELDS = ("builds[number,result,building,timestamp,duration,url,actions["
+                 "parameters[name,value],lastBuiltRevision[SHA1,branch[name,SHA1]],"
+                 "causes[userName,shortDescription]]]{0,%d}")
+
+
+def _entry(raw):
+    """把一个 job 的原始构建列表转成缓存条目。解析放在这里做一次，
+    别放到 run_check 里 —— 那样 60 秒内每点一次都要把上万条构建重解析一遍。"""
+    raw = raw or []
+    return {"ts": time.time(),
+            "builds": [read_build(b) for b in raw],
+            # Jenkins 只给最近 N 次。取满了就说明可能还有更老的没拿到，
+            # 这个标记用来判断「时间窗内没构建」到底是真没发，还是被截断了没看见。
+            "trunc": len(raw) >= MAX_BUILDS_PER_JOB}
+
+
+def fetch_job_names(user, token_, force=False):
+    """只拉 job 名和 url。几百 KB 级别，秒回 —— 站点清单、组件归属、展示名都够用了。"""
+    b = _bucket(user)
+    t0 = time.time()
+    hit = b["names"]
+    if not force and hit and t0 - hit["ts"] < CACHE_TTL:
+        return hit["jobs"]
+    with _lock_for((user, "names")):
+        hit = b["names"]
+        # 等锁期间别人已经拉过一轮：那一轮就是这次刷新，force 也直接用它的结果
+        if hit and (hit["ts"] >= t0 or (not force and time.time() - hit["ts"] < CACHE_TTL)):
             return hit["jobs"]
-    tree = (
-        "jobs[name,url,builds[number,result,building,timestamp,duration,url,actions["
-        "parameters[name,value],lastBuiltRevision[SHA1,branch[name,SHA1]],"
-        "causes[userName,shortDescription]]]{0,%d}]" % MAX_BUILDS_PER_JOB
-    )
-    data = jenkins_get("/api/json?tree=" + urllib.parse.quote(tree, safe="[]{},"), user, token_)
-    jobs = data.get("jobs", []) or []
-    with _cache_lock:
-        _cache[user] = {"ts": now, "jobs": jobs}
-    return jobs
+        data = jenkins_get("/api/json" + _q("jobs[name,url]"), user, token_, timeout=120)
+        jobs = data.get("jobs", []) or []
+        with _cache_lock:
+            b["names"] = {"ts": time.time(), "jobs": jobs}
+        return jobs
+
+
+def _fetch_builds_bulk(user, token_):
+    """一次请求拿全部 job 的构建历史。响应十几 MB、要几十秒，
+    只在「按需拉」不划算（需要的 job 太多）或被限速退回时才走这条。"""
+    tree = "jobs[name," + (_BUILD_FIELDS % MAX_BUILDS_PER_JOB) + "]"
+    data = jenkins_get("/api/json" + _q(tree), user, token_, timeout=180)
+    return {j.get("name"): _entry(j.get("builds")) for j in (data.get("jobs") or []) if j.get("name")}
+
+
+def _fetch_builds_each(names, user, token_):
+    """按 job 逐个拉，线程池并发。返回 (结果, 失败列表, 是否中途放弃)。"""
+    got, errs = {}, []
+    stop = threading.Event()
+
+    def one(name):
+        if stop.is_set():          # 已经决定放弃了，剩下的别再往 Jenkins 上打
+            return None
+        path = "/job/" + urllib.parse.quote(name, safe="") + "/api/json"
+        return name, jenkins_get(path + _q(_BUILD_FIELDS % MAX_BUILDS_PER_JOB),
+                                 user, token_, timeout=60)
+
+    with ThreadPoolExecutor(max_workers=min(FETCH_CONCURRENCY, len(names))) as pool:
+        for name, res in zip(names, pool.map(lambda n: _safe(one, n), names)):
+            if res is None:
+                continue
+            if isinstance(res, Exception):
+                errs.append((name, str(getattr(res, "reason", res))))
+                # 连错 5 个而且一个都没成 —— 要么 Token 废了，要么被 WAF 限速了。
+                # 这时候把剩下几百个必然失败的请求打完毫无意义，还正好是最招限速的行为。
+                if not got and len(errs) >= 5:
+                    stop.set()
+            else:
+                got[res[0]] = _entry(res[1].get("builds"))
+    return got, errs, stop.is_set()
+
+
+def _safe(fn, arg):
+    try:
+        return fn(arg)
+    except Exception as e:      # 单个 job 拉失败不能把整批带崩，收集起来后面统一处理
+        return e
+
+
+def fetch_builds(names, user, token_, force=False):
+    """
+    拿这些 job 的构建历史（已解析）。返回 {job名: 条目}。
+
+    只拉真正要核对的那些 job —— 一次核对通常几十上百个，而 Jenkins 上有六百多个，
+    全量拉等于九成的数据白传。需要的量太大时自动退回一次性全量。
+    """
+    b = _bucket(user)
+    now = time.time()
+    out, todo = {}, []
+    for n in names:
+        e = b["builds"].get(n)
+        if not force and e and now - e["ts"] < CACHE_TTL:
+            out[n] = e
+        else:
+            todo.append(n)
+    if not todo:
+        return out, []
+
+    warns = []
+    with _lock_for((user, "builds")):
+        # 等锁期间别人可能已经把其中一部分拉好了，重新过一遍缓存，能少拉就少拉
+        still = []
+        for n in todo:
+            e = b["builds"].get(n)
+            if e and e["ts"] >= now:
+                out[n] = e
+            else:
+                still.append(n)
+        if still:
+            if len(still) >= BULK_THRESHOLD:
+                got = _fetch_builds_bulk(user, token_)
+            else:
+                got, errs, gave_up = _fetch_builds_each(still, user, token_)
+                # 中途放弃、或失败过半，基本是被 WAF 限速了（逐个打太密），退回一次性全量重来
+                if gave_up or len(errs) * 2 >= len(still):
+                    got = _fetch_builds_bulk(user, token_)
+                elif errs:
+                    warns.append("有 %d 个任务的构建历史没拉到，这些任务的结果不准：%s%s（原因：%s）"
+                                 % (len(errs), ", ".join(n for n, _ in errs[:5]),
+                                    "…" if len(errs) > 5 else "", errs[0][1]))
+            with _cache_lock:
+                b["builds"].update(got)
+            for n in still:
+                out[n] = got.get(n) or {"ts": time.time(), "builds": [], "trunc": False}
+    return out, warns
 
 
 def tz_label():
@@ -158,9 +293,11 @@ def friendly_neterr(e):
     return "连接 Jenkins 失败：%s" % s
 
 
-def cached_at(user):
-    hit = _cache.get(user)
-    return datetime.fromtimestamp(hit["ts"]).strftime("%H:%M:%S") if hit else ""
+def cached_at(entries):
+    """数据快照时间。取本次实际用到的那几份缓存里最早的一个 ——
+    报最新的会让人以为数据比实际更鲜，而漏判恰恰出在最旧的那份上。"""
+    ts = [e["ts"] for e in entries if e]
+    return datetime.fromtimestamp(min(ts)).strftime("%H:%M:%S") if ts else ""
 
 
 # ---------------------------------------------------------------- 解析与判定
@@ -180,7 +317,9 @@ def site_of(job_name):
 
 
 def component_of(job_name):
-    m = re.match(r"^AR\d+-([^-]+)-", job_name)
+    # 尾部的 - 要可选：少数 job 就叫 AR001-Pages，没有国家/站点段。
+    # 写死成必须有 - 的话，这类 job 建不进索引，会被判成「该站点没有这个任务」。
+    m = re.match(r"^AR\d+-([^-]+)(?:-|$)", job_name)
     return m.group(1) if m else ""
 
 
@@ -402,7 +541,6 @@ def read_build(b):
 
 
 def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
-    jobs = fetch_all_jobs(user, token_, force=force)
     comps, warns = parse_components(text)
     sites = parse_sites(text)
     site_group = parse_groups(text)      # {站点: 分组}，无分组时为 ''
@@ -411,17 +549,26 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
     frm = day0.timestamp()
     to = (day0 + timedelta(days=max(1, days))).timestamp()
 
+    # 解析不出组件就没必要打 Jenkins 了 —— 粘错内容是最常见的情况，别让它等几十秒
     if not comps:
         warns.append("发布单里没解析出组件行（形如「LotteryApi → tag: xxx」或「web → 分支: xxx」），请检查粘贴内容")
         return {"ok": False, "warnings": warns, "sites": sites, "components": [], "rows": []}
 
+    jobs = fetch_job_names(user, token_, force=force)
     known = sorted({site_of(j["name"]) for j in jobs if site_of(j["name"])})
     comp_names = {c["name"] for c in comps}
 
+    # (站点, 组件) -> job 列表。建一次索引，替代「每个站点每个组件都线性扫一遍全部 job」，
+    # 六百个 job × 几百个组合原本是三十万次正则匹配。
+    index = {}
+    for j in jobs:
+        s, cp = site_of(j["name"]), component_of(j["name"])
+        if s and cp:
+            index.setdefault((s, cp), []).append(j)
+
     if all_sites:
         # 全量：凡是拥有本次任一组件的站点全部纳入，清单一行不用写，也就抄不漏
-        sites = sorted({site_of(j["name"]) for j in jobs
-                        if site_of(j["name"]) and component_of(j["name"]) in comp_names})
+        sites = sorted({s for (s, cp) in index if cp in comp_names})
         src = "全量（所有拥有这些组件的站点）"
     else:
         src = "发布单正文解析"
@@ -462,64 +609,106 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
         if c.get("site"):
             override.setdefault(c["name"], set()).add(c["site"])
 
-    rows = []
+    # 先排计划（哪些组件×站点×job 要看），再一次性把这些 job 的构建历史拉回来。
+    # 分两趟是为了「按需拉」：只有排进计划的 job 才值得花一次请求。
+    plan, wanted, nogroup = [], set(), set()
     for c in comps:
-        expect = normalize_ref(c["expect"])
         if c.get("site"):
             comp_sites = [s for s in sites if s == c["site"]]
             if not comp_sites:
                 warns.append(f"发布代码里给 {c['site']} 单独指定了分支，但站点清单里没有这个站点")
         else:
-            comp_sites = [s for s in sites
-                          if (not c["group"] or site_group.get(s, "") == c["group"])
-                          and s not in override.get(c["name"], set())]
+            comp_sites = []
+            for s in sites:
+                if s in override.get(c["name"], set()):
+                    continue
+                if c["group"]:
+                    g = site_group.get(s, "")
+                    if g != c["group"]:
+                        # 分组对不上就跳过。但「压根没有分组归属」得记下来单独告警 ——
+                        # 尤其是勾了「核对全部站点」时，站点来自 Jenkins 而分组只写在发布单正文里，
+                        # 大部分站点的分组都是空的，会被整片静默跳过。
+                        if not g:
+                            nogroup.add(s)
+                        continue
+                comp_sites.append(s)
             if c["group"] and not comp_sites:
                 warns.append(f"发布代码里写了「{c['raw']}（{c['group']}）」，但站点清单里没有「{c['group']}」分组的站点")
         for s in comp_sites:
-            matched = [j for j in jobs
-                       if re.match(r"^%s-%s(-|$)" % (re.escape(s), re.escape(c["name"])), j["name"])]
-            if not matched:
-                rows.append({"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
-                             "group": c["group"], "onlySite": c.get("site",""), "view": COMPONENT_VIEW.get(c["name"], ""), "job": "",
-                             "state": "NOJOB", "expect": c["expect"], "detail": "该站点没有这个任务"})
+            matched = index.get((s, c["name"]), [])
+            plan.append((c, s, matched))
+            wanted.update(j["name"] for j in matched)
+
+    if nogroup:
+        lst = sorted(nogroup)
+        warns.append("这 %d 个站点在发布单正文里找不到分组归属，所有带分组的组件都没核对它们"
+                     "%s：%s%s" % (len(lst), "（勾了「核对全部站点」时常见）" if all_sites else "",
+                                   ", ".join(lst[:12]), "…" if len(lst) > 12 else ""))
+
+    builds_map, fetch_warns = fetch_builds(sorted(wanted), user, token_, force=force)
+    warns.extend(fetch_warns)
+
+    rows, truncated = [], set()
+    for c, s, matched in plan:
+        expect = normalize_ref(c["expect"])
+        if not matched:
+            rows.append({"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
+                         "group": c["group"], "onlySite": c.get("site",""), "view": COMPONENT_VIEW.get(c["name"], ""), "job": "",
+                         "state": "NOJOB", "expect": c["expect"], "detail": "该站点没有这个任务"})
+            continue
+        for j in matched:
+            e = builds_map.get(j["name"]) or {"builds": [], "trunc": False}
+            inwin = sorted([x for x in e["builds"] if frm <= x["ts"] < to],
+                           key=lambda x: x["ts"], reverse=True)
+            # 同站点同组件可能有多个 job（如 某站点的 Pages 有 5 个），
+            # 用去掉「AR###-组件-」前缀后的剩余部分区分，否则色块长得一模一样
+            suffix = re.sub(r"^%s-%s-?" % (re.escape(s), re.escape(c["name"])), "", j["name"])
+            base = {"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
+                    "group": c["group"], "onlySite": c.get("site",""), "view": COMPONENT_VIEW.get(c["name"], ""), "job": j["name"],
+                    "jobSuffix": suffix if len(matched) > 1 else "", "expect": c["expect"]}
+            if not inwin:
+                # Jenkins 只给最近 N 次构建。若这 N 次全都晚于时间窗，那窗口内那次很可能
+                # 是被截掉了没拿到 —— 这时报「未发布」是错的，会让人去重发一个已经发过的站点。
+                cut = e["trunc"] and e["builds"] and min(x["ts"] for x in e["builds"]) > frm
+                if cut:
+                    truncated.add(j["name"])
+                rows.append(dict(base, state="MISS", url=j.get("url", ""),
+                                 detail=("最近 %d 次构建都晚于时间窗，可能没查全（不一定真的没发）" % MAX_BUILDS_PER_JOB)
+                                        if cut else "时间窗内没有构建"))
                 continue
-            for j in matched:
-                inwin = sorted(
-                    [x for x in (read_build(b) for b in (j.get("builds") or [])) if frm <= x["ts"] < to],
-                    key=lambda x: x["ts"], reverse=True)
-                # 同站点同组件可能有多个 job（如 某站点的 Pages 有 5 个），
-                # 用去掉「AR###-组件-」前缀后的剩余部分区分，否则色块长得一模一样
-                suffix = re.sub(r"^%s-%s-?" % (re.escape(s), re.escape(c["name"])), "", j["name"])
-                base = {"site": s, "siteName": disp.get(s, ""), "comp": c["name"], "compKey": c["key"],
-                        "group": c["group"], "onlySite": c.get("site",""), "view": COMPONENT_VIEW.get(c["name"], ""), "job": j["name"],
-                        "jobSuffix": suffix if len(matched) > 1 else "", "expect": c["expect"]}
-                if not inwin:
-                    rows.append(dict(base, state="MISS", detail="时间窗内没有构建", url=j.get("url", "")))
-                    continue
-                b = inwin[0]  # 窗口内最后一次构建为准
-                actual = b["want"] or b["got"]
-                if b["result"] == "BUILDING":
-                    st, detail = "RUN", f"#{b['num']} 正在构建中"
-                elif b["result"] != "SUCCESS":
-                    st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
-                elif expect and actual and normalize_ref(actual) != expect:
-                    st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
-                else:
-                    st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
-                rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
-                                 time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"], actual=actual,
-                                 dur=b["dur"], url=b["url"]))
+            b = inwin[0]  # 窗口内最后一次构建为准
+            actual = b["want"] or b["got"]
+            if b["result"] == "BUILDING":
+                st, detail = "RUN", f"#{b['num']} 正在构建中"
+            elif b["result"] != "SUCCESS":
+                st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
+            elif expect and not actual:
+                # 构建成功了，但既没有 TAG/BRANCH_NAME 参数也没有 lastBuiltRevision，
+                # 无从判断发的是哪个版本。以前这种落 OK（绿色），等于把「没核对」显示成「核对通过」。
+                st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录分支/tag，版本无法核对"
+            elif expect and actual and normalize_ref(actual) != expect:
+                st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
+            else:
+                st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
+            rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
+                             time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"], actual=actual,
+                             dur=b["dur"], url=b["url"]))
 
     summary = {}
     for r in rows:
         summary[r["state"]] = summary.get(r["state"], 0) + 1
     if unknown:
         warns.append("这些编号 Jenkins 上不存在，请核对发布单：" + ", ".join(unknown))
+    if truncated:
+        warns.append("有 %d 个任务判成「未发布」，但它们最近 %d 次构建全都晚于时间窗 —— "
+                     "很可能是发过之后又构建了很多次、被截断没查到。把 JENKINS_MAX_BUILDS 调大，"
+                     "或把发版日期改准，再核对一次。" % (len(truncated), MAX_BUILDS_PER_JOB))
 
+    snap = [_bucket(user)["names"]] + [builds_map[n] for n in sorted(wanted) if n in builds_map]
     return {"ok": True, "source": src, "date": date_str, "days": days,
             "sites": sites, "unknown": unknown, "components": comps,
             "rows": rows, "summary": summary, "warnings": warns,
-            "tz": tz_label(), "cachedAt": cached_at(user)}
+            "tz": tz_label(), "cachedAt": cached_at(snap)}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -555,7 +744,7 @@ button.sec{background:transparent;color:var(--mut);border:1px solid var(--bd);fo
 .pills{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 14px}
 .pill{padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600}
 .OK{background:var(--okbg);color:var(--ok)}.MISS,.FAIL{background:var(--badbg);color:var(--bad)}
-.VER{background:var(--warnbg);color:var(--warn)}.RUN{background:var(--runbg);color:var(--run)}
+.VER,.NOVER{background:var(--warnbg);color:var(--warn)}.RUN{background:var(--runbg);color:var(--run)}
 .NOJOB{background:var(--nonebg);color:var(--none)}
 .warn{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:9px 12px;margin-bottom:9px;font-size:13px}
 h2{font-size:15px;margin:22px 0 4px;display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
@@ -572,7 +761,7 @@ summary{cursor:pointer;color:var(--mut);font-size:12.5px;user-select:none}
 summary:hover{color:var(--fg)}
 .cell.s-OK{background:var(--okbg);border-color:transparent}
 .cell.s-MISS,.cell.s-FAIL{background:var(--badbg);border-color:transparent}
-.cell.s-VER{background:var(--warnbg);border-color:transparent}
+.cell.s-VER,.cell.s-NOVER{background:var(--warnbg);border-color:transparent}
 .cell.s-RUN{background:var(--runbg);border-color:transparent}
 .cell.s-NOJOB{background:var(--nonebg);border-color:transparent;opacity:.65}
 table{width:100%;border-collapse:collapse;margin-top:9px;font-size:12.5px}
@@ -580,9 +769,13 @@ th,td{text-align:left;padding:6px 9px;border-bottom:1px solid var(--bd);vertical
 th{color:var(--mut);font-weight:600;font-size:12px}
 td a{color:inherit}
 .st{font-weight:700;white-space:nowrap}
-.st.OK{color:var(--ok)}.st.MISS,.st.FAIL{color:var(--bad)}.st.VER{color:var(--warn)}.st.RUN{color:var(--run)}
+.st.OK{color:var(--ok)}.st.MISS,.st.FAIL{color:var(--bad)}
+.st.VER,.st.NOVER{color:var(--warn)}.st.RUN{color:var(--run)}
 .empty{color:var(--mut);padding:22px;text-align:center}
 .tbwrap{overflow-x:auto}
+.h2r{margin-left:auto;font-size:12px;font-weight:400}
+.lnk{color:var(--run);cursor:pointer;text-decoration:underline;font-size:12.5px}
+#poll{color:var(--run);font-size:12.5px;margin-top:8px}
 </style></head><body><div class="wrap">
 <h1>Jenkins 发版核对</h1>
 <div class="sub">把发布单整段复制粘进来 → 点「开始检查」。站点编号和组件 tag 都自动解析，只读不触发构建。</div>
@@ -624,17 +817,27 @@ td a{color:inherit}
     <div class="f chk"><input type="checkbox" id="all"><label for="all">忽略站点清单，核对全部站点</label></div>
     <div class="f chk"><input type="checkbox" id="prob"><label for="prob">只看有问题的</label></div>
     <div class="f"><button id="go">开始检查</button></div>
-    <div class="f"><button id="refresh" class="sec" title="跳过 60 秒缓存，重新拉取 Jenkins">强制刷新</button></div>
+    <div class="f"><button id="refresh" class="sec" title="跳过缓存，重新拉取 Jenkins">强制刷新</button></div>
   </div>
 </div>
 <div id="out"></div>
 </div>
 <script>
 const $=i=>document.getElementById(i);
-const LABEL={OK:'已发布',MISS:'未发布',FAIL:'构建失败',VER:'版本不符',RUN:'构建中',NOJOB:'无此任务'};
+const LABEL={OK:'已发布',MISS:'未发布',FAIL:'构建失败',VER:'版本不符',
+             NOVER:'版本未知',RUN:'构建中',NOJOB:'无此任务'};
+// 需要人看一眼的状态，顺序即严重程度。NOVER 排最后：它不是「发错了」，是「查不出发的啥」。
+const BAD=['MISS','FAIL','VER','RUN','NOVER'];
 // 默认日期由服务端给（见 /api/config）。别用浏览器本地日期 —— 时间窗是按服务端时区切的，
 // 浏览器在 UTC+8、容器在 UTC+5:30 的话会差一天。拿不到时才回落到浏览器日期。
 $('date').value=new Date().toLocaleDateString('sv');   // sv locale 天然是 YYYY-MM-DD
+
+// ---- 发布单存本地：核对完常要刷新页面重查，每次都重新粘一遍太蠢 ----
+// 存 localStorage 不存 sessionStorage：关掉标签页第二天接着核对也还在。
+// 里面是内网站点清单，别跟凭据混在一起，也不上传服务端。
+const DK='jrc_draft';
+try{const d=localStorage.getItem(DK);if(d)$('txt').value=d;}catch(e){}
+$('txt').addEventListener('input',()=>{try{localStorage.setItem(DK,$('txt').value);}catch(e){}});
 
 // ---- 凭据：只放 sessionStorage，不落 localStorage，关标签页即失效 ----
 const CK='jrc_user',TK='jrc_token';
@@ -660,7 +863,28 @@ fetch('/api/config').then(r=>r.json()).then(cfg=>{
   }
 }).catch(()=>{});
 
-async function check(force){
+// ---- 「构建中」自动复查：发版收尾时总有几个还在跑，否则要守着手点 ----
+let pollTimer=null,pollLeft=0,pollRounds=0;
+function stopPoll(msg){
+  if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+  const el=$('poll'); if(el)el.textContent=msg||'';
+}
+function startPoll(n){
+  stopPoll();
+  // 封顶 20 轮（10 分钟）。构建卡住的时候没必要一直空转打 Jenkins。
+  if(pollRounds>=20){const el=$('poll');if(el)el.textContent='已自动复查 20 轮，还有 '+n+' 项在构建中，请手动刷新。';return;}
+  pollLeft=30;
+  const tick=()=>{
+    const el=$('poll'); if(!el){stopPoll();return;}
+    el.innerHTML='还有 '+n+' 项在构建中 · '+pollLeft+' 秒后自动复查 <span class="lnk" onclick="stopPoll(\'已停止自动复查\')">停止</span>';
+    if(pollLeft--<=0){stopPoll();pollRounds++;check(true,true);}
+  };
+  tick(); pollTimer=setInterval(tick,1000);
+}
+
+async function check(force,isPoll){
+  stopPoll();
+  if(!isPoll)pollRounds=0;      // 手动点一次就重新开始计轮
   const t=$('txt').value.trim();
   if(!t){$('out').innerHTML='<div class="card empty">先把发布单粘贴到上面的文本框</div>';return;}
   $('go').disabled=true;$('go').textContent='检查中…';
@@ -690,13 +914,13 @@ const norm=s=>String(s||'').replace(/^refs\/remotes\//,'').replace(/^refs\/heads
 
 function render(d){
   window.__d=d;
-  const only=$('prob').checked, BAD=['MISS','FAIL','VER','RUN'];
+  const only=$('prob').checked;
   let h='';
   (d.warnings||[]).forEach(w=>h+='<div class="warn">⚠ '+esc(w)+'</div>');
   if(!d.ok){$('out').innerHTML=h||'<div class="card empty">没解析出内容</div>';return;}
 
   h+='<div class="card"><div class="pills">';
-  ['OK','VER','FAIL','MISS','RUN','NOJOB'].forEach(k=>{if(d.summary[k])
+  ['OK','VER','NOVER','FAIL','MISS','RUN','NOJOB'].forEach(k=>{if(d.summary[k])
     h+='<span class="pill '+k+'">'+LABEL[k]+' '+d.summary[k]+'</span>';});
   h+='</div><div class="sub" style="margin:0">站点来源：'+esc(d.source)+' · '+d.sites.length+
      ' 个站点 × '+d.components.length+' 个组件 · 时间窗 '+esc(d.date)+
@@ -704,7 +928,9 @@ function render(d){
 
   const bad=d.rows.filter(r=>BAD.includes(r.state));
   if(bad.length){
-    h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+bad.length+' 项</span></h2><div class="tbwrap"><table>'+
+    h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+bad.length+' 项</span>'+
+       '<span class="h2r"><button class="sec" id="copybad">复制清单</button></span></h2>'+
+       '<div id="poll"></div><div class="tbwrap"><table>'+
        '<tr><th>状态</th><th>站点</th><th>任务</th><th>说明</th></tr>';
     bad.sort((a,b)=>BAD.indexOf(a.state)-BAD.indexOf(b.state));
     bad.forEach(r=>{h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
@@ -771,16 +997,45 @@ function render(d){
   });
   h+='</div>';
   $('out').innerHTML=h;
+
+  // 核对完要把结果贴到群里。表格里手选会连样式一起带走，这里直接给纯文本。
+  const cb=$('copybad');
+  if(cb)cb.onclick=()=>{
+    const txt=['发版核对 '+d.date+(d.days>1?' 起 '+d.days+' 天':'')+' · '+
+               BAD.filter(k=>d.summary[k]).map(k=>LABEL[k]+' '+d.summary[k]).join(' / ')]
+      .concat(bad.map(r=>'['+LABEL[r.state]+'] '+r.site+(r.siteName?'('+r.siteName+')':'')+
+                          ' '+(r.job||'-')+'  '+(r.detail||''))).join('\n');
+    const done=()=>{cb.textContent='已复制';setTimeout(()=>cb.textContent='复制清单',1500);};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt).then(done,()=>fallback(txt,done));}
+    else fallback(txt,done);
+  };
+  // 构建中的项会自己变，隔 30 秒重查一次，省得守着手点
+  if(d.summary.RUN)startPoll(d.summary.RUN);
+}
+
+function fallback(txt,done){
+  const ta=document.createElement('textarea');
+  ta.value=txt;ta.style.position='fixed';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy');done();}catch(e){alert('复制失败，请手动选中表格');}
+  document.body.removeChild(ta);
 }
 </script></body></html>"""
 
 
+PAGE_BYTES = PAGE.encode("utf-8")   # 18KB，每次 GET 都重新 encode 是白干
+
+
 class Handler(BaseHTTPRequestHandler):
+    # 开 keep-alive：一次核对要打 /api/config + /api/check，HTTP/1.0 每次都得重新建连接
+    # （含 TLS 握手）。所有响应都带准确的 Content-Length，可以安全地开。
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         sys.stderr.write("  %s - %s\n" % (self.address_string(), fmt % args))
 
     def _send(self, code, body, ctype):
-        raw = body.encode("utf-8")
+        raw = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
@@ -805,7 +1060,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = self.path.split("?")[0]
         if p in ("/", "/index.html"):
-            self._send(200, PAGE, "text/html")
+            self._send(200, PAGE_BYTES, "text/html")
         elif p == "/api/config":
             # 前端据此决定要不要显示「填写自己的 Jenkins 凭据」表单。
             # today/tz 也由服务端给：时间窗是按服务端时区切的，若用浏览器本地日期当默认值，
@@ -823,9 +1078,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path != "/api/check":
+            self.close_connection = True       # body 没读，keep-alive 下必须断开
             self._send(404, json.dumps({"error": "not found"}), "application/json")
             return
         try:
+            # 先把请求体读掉再做别的检查：开了 keep-alive，任何「没读完 body 就回包」
+            # 都会让连接里剩下的字节被当成下一个请求的开头，整条连接就串了。
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > MAX_BODY:
+                self.close_connection = True
+                self._send(413 if n > MAX_BODY else 400, json.dumps(
+                    {"error": "请求体大小不合法（%d 字节）" % n}, ensure_ascii=False), "application/json")
+                return
+            body = self.rfile.read(n)
             if not JENKINS_URL:
                 raise RuntimeError("服务端没配 JENKINS_URL")
             user, token_ = self.creds()
@@ -834,8 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": "请先在页面右上角填写你自己的 Jenkins 用户名和 API Token", "needCreds": True},
                     ensure_ascii=False), "application/json")
                 return
-            n = int(self.headers.get("Content-Length") or 0)
-            req = json.loads(self.rfile.read(n).decode("utf-8"))
+            req = json.loads(body.decode("utf-8"))
             res = run_check(
                 req.get("text", ""),
                 req.get("date") or datetime.now().strftime("%Y-%m-%d"),
