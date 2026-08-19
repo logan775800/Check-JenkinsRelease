@@ -374,7 +374,7 @@ bash deploy/cloudflare/install-cloudflared.sh jc.你的域名
 **当前是 Docker Compose 部署**（见上「用 Docker 跑」），在仓库目录里：
 
 ```bash
-cd ~/Check-JenkinsRelease        # 你 clone 的位置
+cd /data/Check-JenkinsRelease    # logan-master 上的实际位置
 git pull
 docker compose up -d --build     # 必须带 --build
 docker compose ps                # STATUS 要是 healthy
