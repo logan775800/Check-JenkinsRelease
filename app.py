@@ -68,6 +68,11 @@ COMPONENT_ALIAS = {
     "前端": "Pages", "web页面": "Pages", "页面": "Pages", "前端页面": "Pages",
     "lotteryapi": "LotteryApi", "lottery": "LotteryApi",
     "webintranetapi": "WebIntranetApi", "intranetapi": "WebIntranetApi",
+    # 发布单里长期就写成 Intrenet（a/e 对调）。这不是要提醒的笔误，是这边的既定写法，
+    # 所以放进别名表走精确匹配 —— 靠下面的近似匹配也能认出来，但每次都会弹一条
+    # 「已按最接近的…核对」黄条，天天核对天天弹，那是噪音。
+    # 以后再冒出别的固定写法，也照这样加一行，不要靠近似匹配兜。
+    "webintrenetapi": "WebIntranetApi", "intrenetapi": "WebIntranetApi",
     "webextendapi": "WebExtendApi", "extendapi": "WebExtendApi",
     "agentapi": "AgentApi",
     "webagent": "Web", "agentweb": "Web",

@@ -241,12 +241,14 @@ print("\n== 10. 组件名拼错要能认出来 ==")
 reset()
 # 真实案例：发布单把 WebIntranetApi 写成 webIntrenetApi（Intranet 的 a/e 对调），
 # 旧版整个组件不核对，而报告里「没核对」和「没问题」长得一模一样。
-c, w = app.parse_components("    webIntrenetApi  →  tag: master_V3.09_308")
-check("认出 webIntrenetApi = WebIntranetApi",
-      len(c) == 1 and c[0]["name"] == "WebIntranetApi", c)
+# Intrenet 是发布单里的**既定写法**，不是笔误：必须精确识别且**一条告警都不许有**。
+# 天天核对天天弹「已按最接近的…核对」就是噪音，他明确反馈过。
+for spell in ("webIntrenetApi", "WebIntrenetApi", "intrenetApi", "web-intrenet-api"):
+    c, w = app.parse_components(f"    {spell}  →  tag: master_V3.09_308")
+    check(f"{spell} 直接识别为 WebIntranetApi",
+          len(c) == 1 and c[0]["name"] == "WebIntranetApi", c)
+    check(f"{spell} 不弹任何告警", not w, w)
 check("期望值没被弄丢", c and c[0]["expect"] == "master_V3.09_308", c)
-check("猜了就必须告警（否则等于偷偷改发布单）",
-      any("相似度" in x and "WebIntranetApi" in x for x in w), w)
 
 for typo, want in (("LoterryApi", "LotteryApi"), ("webextandapi", "WebExtendApi"),
                    ("ThirdJobb", "ThirdJob"), ("Pagess", "Pages")):

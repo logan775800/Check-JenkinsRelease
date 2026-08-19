@@ -73,7 +73,12 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 ```
 
 组件名容错：`web` / `Web-Pages` / `web-pages` / `WEB_PAGES` / `webpages` / `Web Pages` / `前端` / `页面`
-全部识别为 `Pages`。箭头可有可无，`tag:` / `分支:` / `branch:` 都认。
+全部识别为 `Pages`；`webIntrenetApi`（发布单里长期这么写）识别为 `WebIntranetApi`。
+箭头可有可无，`tag:` / `分支:` / `branch:` 都认。
+
+**发布单里固定用的写法，一律加进 `COMPONENT_ALIAS`**（`app.py` 顶部，一行一个），
+让它走精确匹配、静默通过。别指望下面那套近似匹配兜——它每次都会弹一条
+「已按最接近的…核对」，天天核对天天弹就成了噪音。
 
 站点编号容错：`AR51` / `ar-051` / `AR0051` 统一归成 `AR051`，自动去重，
 **发布单里写了但 Jenkins 上不存在的编号会单独报出来**（抓发布单笔误）。
