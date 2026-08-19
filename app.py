@@ -16,6 +16,7 @@ Jenkins 发版核对 · 本地网页版
 只读，不会触发任何构建。零第三方依赖（Python 标准库）。
 """
 import base64
+import difflib
 import json
 import os
 import re
@@ -399,20 +400,73 @@ _COMP_LINE = re.compile(
 _QUAL_LINE = re.compile(r"^\s*(?P<label>[^:：]+?)\s*[:：]\s*(?P<val>\S+)\s*$")
 
 
-def resolve_component(raw):
-    """发布单里的组件写法 -> Jenkins 组件名。返回 (组件名, 是否属于「不在这套 Jenkins」)。"""
+# 拼错一个字母，这个组件就整个不核对 —— 而「没核对」在报告里长得跟「没问题」一模一样。
+# 实际发生过：发布单写 webIntrenetApi（Intranet 的 a/e 对调），WebIntranetApi 那一栏
+# 就此空白，没人会注意到少了一个组件。所以对认不出来的名字做一次近似匹配。
+#
+# 阈值 0.80 是量出来的，不是拍的：
+#   • 那个真实错拼对 WebIntranetApi 是 0.929；
+#   • 而**任意两个真实组件之间**最高只有 0.625（ThirdApi vs ThirdJob）；
+#   • 乱写的字符串（"api"/"aaa"）最高 0.545。
+# 0.80 卡在中间一大段空档里。改阈值前先把这三个数重新量一遍（tools\selftest.py 有守）。
+FUZZY_MIN = 0.80
+FUZZY_GAP = 0.06        # 最像的和第二像的差不到这么多 = 分不清，宁可不猜
+FUZZY_MIN_LEN = 5       # 太短的名字容易撞上，"api" 这种一律不猜
+
+
+def _fuzzy_pool():
+    """近似匹配的候选池：Jenkins 组件名 + 纯 ASCII 的别名 + 不在本 Jenkins 的那几个。
+
+    只收 ASCII：中文别名（前端/页面/后台）本来就短，逐字比相似度容易乱配，
+    而它们精确匹配已经够用了。
+    """
+    pool = {}
+    for v in set(COMPONENT_ALIAS.values()):
+        pool[canon(v)] = (v, False)
+    for k, v in COMPONENT_ALIAS.items():
+        pool.setdefault(k, (v, False))
+    for k in NOT_IN_JENKINS:
+        pool.setdefault(k, (None, True))
+    return {k: v for k, v in pool.items() if k.isascii() and k.isalnum()}
+
+
+def fuzzy_component(key):
+    """认不出来的名字 -> (组件名, 不在本Jenkins, 相似度)。拿不准就返回 (None, False, 0)。"""
+    if len(key) < FUZZY_MIN_LEN or not key.isascii() or not key.isalnum():
+        return None, False, 0.0
+    scored = sorted(((difflib.SequenceMatcher(None, key, k).ratio(), k)
+                     for k in _fuzzy_pool()), reverse=True)
+    if not scored or scored[0][0] < FUZZY_MIN:
+        return None, False, 0.0
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < FUZZY_GAP:
+        # 两个候选一样像：猜错比不猜更糟，因为报告会理直气壮地按错的那个核对
+        return None, False, 0.0
+    name, not_here = _fuzzy_pool()[scored[0][1]]
+    return name, not_here, scored[0][0]
+
+
+def resolve_component(raw, fuzzy=False):
+    """发布单里的组件写法 -> Jenkins 组件名。
+
+    返回 (组件名, 是否属于「不在这套 Jenkins」, 近似匹配到的相似度)。
+    相似度 >0 表示这次是**猜**的，调用方必须把这件事告诉用户。
+    """
     key = canon(raw)
     if not key:
-        return None, False
+        return None, False, 0.0
     if key in NOT_IN_JENKINS:
-        return None, True
+        return None, True, 0.0
     name = COMPONENT_ALIAS.get(key)
     if not name:                       # 也允许直接写 Jenkins 里的组件名本身
         for v in set(COMPONENT_ALIAS.values()):
             if canon(v) == key:
                 name = v
                 break
-    return name, False
+    if name:
+        return name, False, 0.0
+    if fuzzy:
+        return fuzzy_component(key)
+    return None, False, 0.0
 
 
 def parse_components(text):
@@ -452,13 +506,23 @@ def parse_components(text):
             has_marker = bool(m.group("arrow") or m.group("kw"))
             # 站点行「（国家）AR001→SiteA」也带箭头，会撞进来，按 AR 编号剔掉
             is_site_line = bool(re.search(r"(?i)\bAR\d{2,4}\b", raw))
-            name, not_here = resolve_component(raw)
+            # 只在组件行开近似匹配。限定词行（下面那段）不开：那些是「非中台版本分支」
+            # 之类的说明文字，让它们也去猜组件名，会把说明当成组件误吃掉。
+            name, not_here, sim = resolve_component(raw, fuzzy=not is_site_line)
 
             if not_here and has_marker:
+                extra = f"（按「{raw}」最接近的名字判断，相似度 {sim:.0%}）" if sim else ""
                 warns.append(f"发布单里的「{raw} → {val}」不在这套 Jenkins 上"
-                             f"（属于另一套后台部署），本次未核对")
+                             f"（属于另一套后台部署），本次未核对{extra}")
                 cur_comp = None
                 continue
+
+            if name and sim:
+                # 猜出来的必须说出来：报告里「没核对」和「没问题」长得一样，
+                # 猜错了他会拿着一份自信的错报告去交差。
+                warns.append(f"发布单里写的「{raw}」在 Jenkins 上没有，"
+                             f"已按最接近的「{name}」核对（相似度 {sim:.0%}）。"
+                             f"如果不对，改掉发布单里的拼写再跑一次。")
 
             if name and not is_site_line:
                 if val and _VALUE_OK.search(val):

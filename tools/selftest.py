@@ -237,7 +237,57 @@ if os.path.exists(real_path):
 else:
     print("  SKIP  local/发布单原文.txt 不存在")
 
-print("\n== 10. 并发去重 ==")
+print("\n== 10. 组件名拼错要能认出来 ==")
+reset()
+# 真实案例：发布单把 WebIntranetApi 写成 webIntrenetApi（Intranet 的 a/e 对调），
+# 旧版整个组件不核对，而报告里「没核对」和「没问题」长得一模一样。
+c, w = app.parse_components("    webIntrenetApi  →  tag: master_V3.09_308")
+check("认出 webIntrenetApi = WebIntranetApi",
+      len(c) == 1 and c[0]["name"] == "WebIntranetApi", c)
+check("期望值没被弄丢", c and c[0]["expect"] == "master_V3.09_308", c)
+check("猜了就必须告警（否则等于偷偷改发布单）",
+      any("相似度" in x and "WebIntranetApi" in x for x in w), w)
+
+for typo, want in (("LoterryApi", "LotteryApi"), ("webextandapi", "WebExtendApi"),
+                   ("ThirdJobb", "ThirdJob"), ("Pagess", "Pages")):
+    c, _ = app.parse_components(f"    {typo} → tag: v1")
+    check(f"{typo} -> {want}", len(c) == 1 and c[0]["name"] == want, c)
+
+for junk in ("随便写个啥", "api", "aaa", "ThirdXyz"):
+    c, w = app.parse_components(f"    {junk} → tag: v2")
+    check(f"「{junk}」不许瞎猜", not c and any("不认识" in x for x in w), (c, w))
+
+# 精确匹配的老路不能被近似匹配抢走
+for exact, want in (("web", "Pages"), ("前端", "Pages"), ("LotteryApi", "LotteryApi")):
+    c, w = app.parse_components(f"    {exact} → tag: v1")
+    check(f"精确匹配 {exact} 不走近似", len(c) == 1 and c[0]["name"] == want
+          and not any("相似度" in x for x in w), (c, w))
+
+c, w = app.parse_components("    admin → tag: v1")
+check("admin 仍判「不在这套 Jenkins」", not c and any("不在这套" in x for x in w), w)
+
+# 阈值守卫：这三个数是当初量出来定 0.80 的依据，谁改阈值先看这里
+import difflib as _dl
+_r = lambda a, b: _dl.SequenceMatcher(None, app.canon(a), app.canon(b)).ratio()
+_names = sorted(set(app.COMPONENT_ALIAS.values()))
+_pairs = max(_r(a, b) for i, a in enumerate(_names) for b in _names[i + 1:])
+check("阈值高于「任意两个真实组件的相似度」上限 %.3f" % _pairs, app.FUZZY_MIN > _pairs, _pairs)
+check("目标错拼仍在阈值之上", _r("webIntrenetApi", "WebIntranetApi") >= app.FUZZY_MIN)
+
+# 限定词行不许开近似匹配，否则说明文字会被当成组件吃掉
+GROUPED_TYPO = """【发布站点】
+中台站点
+（印度）AR001→site1
+
+【发布步骤】
+    webIntrenetApi  分支：
+        中台版本分支：  master_V3.08_001
+"""
+c, w = app.parse_components(GROUPED_TYPO)
+check("错拼组件 + 分组写法仍能解析",
+      len(c) == 1 and c[0]["name"] == "WebIntranetApi" and c[0]["group"] == "中台", c)
+
+print("\n== 11. 并发去重 ==")
 reset()
 plain = app.jenkins_get
 
