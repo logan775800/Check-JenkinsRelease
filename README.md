@@ -371,8 +371,29 @@ bash deploy/cloudflare/install-cloudflared.sh jc.你的域名
 
 ### 更新
 
+**当前是 Docker Compose 部署**（见上「用 Docker 跑」），在仓库目录里：
+
+```bash
+cd ~/Check-JenkinsRelease        # 你 clone 的位置
+git pull
+docker compose up -d --build     # 必须带 --build
+docker compose ps                # STATUS 要是 healthy
+curl -s localhost:8770/healthz   # 回 ok
+```
+
+**`--build` 不能省。** `app.py` 是 `COPY` 进镜像的（Dockerfile 第 15 行），
+compose 里也没挂 volumes，所以不重建镜像的话 `git pull` 拉下来的新代码根本进不了容器 ——
+`docker compose restart` 会显示成功，跑的还是老代码，最难查的就是这种。
+
+改完 `.env`（只动配置、没动代码）才可以用 `docker compose restart`。
+
+<details><summary>早期 systemd 部署方式（已弃用，留档）</summary>
+
 ```bash
 cd Check-JenkinsRelease && git pull
 install -m 0644 app.py /opt/check-jenkins-release/app.py
 systemctl restart check-jenkins-release
 ```
+
+`deploy/install-docker.sh` 会自动停掉这个 systemd 服务（它抢 8770 端口）。
+</details>
