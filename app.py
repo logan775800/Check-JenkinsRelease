@@ -1108,7 +1108,7 @@ button.sec{background:transparent;color:var(--mut);border:1px solid var(--bd);fo
 .pills{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 14px}
 .pill{padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600}
 .OK{background:var(--okbg);color:var(--ok)}.MISS,.FAIL{background:var(--badbg);color:var(--bad)}
-.VER,.NOVER{background:var(--warnbg);color:var(--warn)}.RUN{background:var(--runbg);color:var(--run)}
+.VER,.NOVER,.STALE{background:var(--warnbg);color:var(--warn)}.RUN{background:var(--runbg);color:var(--run)}
 .NOJOB{background:var(--nonebg);color:var(--none)}
 .warn{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:9px 12px;margin-bottom:9px;font-size:13px}
 h2{font-size:15px;margin:22px 0 4px;display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
@@ -1125,7 +1125,7 @@ summary{cursor:pointer;color:var(--mut);font-size:12.5px;user-select:none}
 summary:hover{color:var(--fg)}
 .cell.s-OK{background:var(--okbg);border-color:transparent}
 .cell.s-MISS,.cell.s-FAIL{background:var(--badbg);border-color:transparent}
-.cell.s-VER,.cell.s-NOVER{background:var(--warnbg);border-color:transparent}
+.cell.s-VER,.cell.s-NOVER,.cell.s-STALE{background:var(--warnbg);border-color:transparent}
 .cell.s-RUN{background:var(--runbg);border-color:transparent}
 .cell.s-NOJOB{background:var(--nonebg);border-color:transparent;opacity:.65}
 table{width:100%;border-collapse:collapse;margin-top:9px;font-size:12.5px}
@@ -1134,7 +1134,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
 td a{color:inherit}
 .st{font-weight:700;white-space:nowrap}
 .st.OK{color:var(--ok)}.st.MISS,.st.FAIL{color:var(--bad)}
-.st.VER,.st.NOVER{color:var(--warn)}.st.RUN{color:var(--run)}
+.st.VER,.st.NOVER,.st.STALE{color:var(--warn)}.st.RUN{color:var(--run)}
 .empty{color:var(--mut);padding:22px;text-align:center}
 .tbwrap{overflow-x:auto}
 .h2r{margin-left:auto;font-size:12px;font-weight:400}
@@ -1189,9 +1189,9 @@ td a{color:inherit}
 <script>
 const $=i=>document.getElementById(i);
 const LABEL={OK:'已发布',MISS:'未发布',FAIL:'构建失败',VER:'版本不符',
-             NOVER:'版本未知',RUN:'构建中',NOJOB:'无此任务'};
+             STALE:'代码落后',NOVER:'版本未知',RUN:'构建中',NOJOB:'无此任务'};
 // 需要人看一眼的状态，顺序即严重程度。NOVER 排最后：它不是「发错了」，是「查不出发的啥」。
-const BAD=['MISS','FAIL','VER','RUN','NOVER'];
+const BAD=['MISS','FAIL','VER','STALE','RUN','NOVER'];
 // 默认日期由服务端给（见 /api/config）。别用浏览器本地日期 —— 时间窗是按服务端时区切的，
 // 浏览器在 UTC+8、容器在 UTC+5:30 的话会差一天。拿不到时才回落到浏览器日期。
 $('date').value=new Date().toLocaleDateString('sv');   // sv locale 天然是 YYYY-MM-DD
@@ -1284,13 +1284,28 @@ function render(d){
   if(!d.ok){$('out').innerHTML=h||'<div class="card empty">没解析出内容</div>';return;}
 
   h+='<div class="card"><div class="pills">';
-  ['OK','VER','NOVER','FAIL','MISS','RUN','NOJOB'].forEach(k=>{if(d.summary[k])
+  ['OK','VER','STALE','NOVER','FAIL','MISS','RUN','NOJOB'].forEach(k=>{if(d.summary[k])
     h+='<span class="pill '+k+'">'+LABEL[k]+' '+d.summary[k]+'</span>';});
   h+='</div><div class="sub" style="margin:0">站点来源：'+esc(d.source)+' · '+d.sites.length+
      ' 个站点 × '+d.components.length+' 个组件 · 时间窗 '+esc(d.date)+
      (d.days>1?' 起 '+d.days+' 天':'')+' · 数据快照 '+esc(d.cachedAt)+(d.tz?' ('+esc(d.tz)+')':'')+'</div></div>';
 
-  const bad=d.rows.filter(r=>BAD.includes(r.state));
+  // 同一组件里 SHA 不是最新的那些行 = 分支名一样但代码是旧的。
+  // 以前只在组件区块里提一句，不进「需要处理」——于是顶部写着「1 项」，
+  // 实际还有站点代码是旧的，得滚很久才看得见。这类漏看正是这工具要防的。
+  const stale=[];
+  d.components.forEach(c=>{
+    const rs=d.rows.filter(r=>r.compKey===c.key&&r.sha&&r.state==='OK');
+    if(rs.length<2)return;
+    const newest=rs.reduce((a,b)=>(b.ts||0)>(a.ts||0)?b:a).sha;
+    rs.forEach(r=>{if(r.sha!==newest)stale.push(Object.assign({},r,{state:'STALE',
+      detail:'分支名对，但代码是旧的：SHA '+r.sha+'（最新是 '+newest+'）'}));});
+  });
+  d.summary.STALE=stale.length||undefined;
+  // 色块也要跟着变色。否则「需要处理」里写着 AR012 代码落后，滚到网格里它却是绿的，
+  // 两处自相矛盾，人会倾向于相信看起来更「正常」的那个。
+  const staleKey=new Set(stale.map(r=>r.compKey+'|'+r.site+'|'+r.job));
+  const bad=d.rows.filter(r=>BAD.includes(r.state)).concat(stale);
   if(bad.length){
     h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+bad.length+' 项</span>'+
        '<span class="h2r"><button class="sec" id="copybad">复制清单</button></span></h2>'+
@@ -1326,11 +1341,15 @@ function render(d){
                     return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());};
       h+='<div class="warn" style="margin:8px 0 0">⚠ 分支名一样但代码不一样：本组件出现 '+keys.length+
          ' 个不同 SHA，说明期间分支上有新提交，先发的站点代码是旧的。'+
-         keys.map(k=>'<br>&nbsp;&nbsp;<code>'+esc(k)+'</code> · '+
-           [...new Set(shas[k].map(r=>r.site))].length+' 个站点 · '+
-           fmt(firstTs(k))+' ~ '+fmt(lastTs(k))+
-           (k===newest?' <b>（最新）</b>':' <b style="color:var(--bad)">（落后）</b>')+' · '+
-           esc([...new Set(shas[k].map(r=>r.site))].join(', '))).join('')+
+         keys.map(k=>{
+           const ss=[...new Set(shas[k].map(r=>r.site))];
+           // 最新那组通常是绝大多数站点，把几十个名字铺出来只会把真正要看的
+           // 「落后的是哪几个」挤到看不见。最新只报个数，落后才点名。
+           return '<br>&nbsp;&nbsp;<code>'+esc(k)+'</code> · '+ss.length+' 个站点 · '+
+             fmt(firstTs(k))+' ~ '+fmt(lastTs(k))+
+             (k===newest?' <b>（最新）</b>'
+                        :' <b style="color:var(--bad)">（落后）</b> · '+esc(ss.join(', ')));
+         }).join('')+
          '</div>';
     }
     h+='<div class="grid">';
@@ -1339,7 +1358,7 @@ function render(d){
       h+='<div class="cell s-'+r.state+'" title="'+esc(r.job+'\n'+r.detail)+'">'+
       '<b>'+esc(r.site)+(r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</b>'+
       '<div class="br'+(diff?' diff':'')+'">'+esc(r.actual||'—')+'</div>'+
-      '<span class="st '+r.state+'" style="font-size:11.5px">'+LABEL[r.state]+'</span>'+
+      '<span class="st '+st+'" style="font-size:11.5px">'+LABEL[st]+'</span>'+
       (r.num?' <small>#'+r.num+'</small>':'')+
       (r.sha?' <small>'+esc(r.sha)+'</small>':'')+
       (r.time?' <small>'+esc(r.time.slice(0,11))+'</small>':'')+
@@ -1351,7 +1370,8 @@ function render(d){
        '<th>SHA</th><th>构建</th><th>时间</th><th>耗时</th><th>触发人</th></tr>';
     rows.forEach(r=>{
       const diff=r.actual&&norm(r.actual)!==norm(c.expect);
-      h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
+      const st2=staleKey.has(r.compKey+'|'+r.site+'|'+r.job)?'STALE':r.state;
+      h+='<tr><td class="st '+st2+'">'+LABEL[st2]+'</td><td>'+esc(r.site)+
         (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
         (r.url?'<a href="'+esc(r.url)+'" target="_blank">'+esc(r.job||'-')+'</a>':esc(r.job||'-'))+
         '</td><td'+(diff?' style="color:var(--bad);font-weight:700"':'')+'>'+esc(r.actual||'—')+'</td><td>'+
