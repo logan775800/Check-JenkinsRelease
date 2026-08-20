@@ -1302,9 +1302,12 @@ function render(d){
     // ——分支是可变指针，它们构建那一刻分支顶端还没有后来那些提交。
     const newest=rs.reduce((a,b)=>(b.ts||0)>(a.ts||0)?b:a).sha;
     const nFirst=Math.min.apply(null,rs.filter(r=>r.sha===newest).map(r=>r.ts||0));
+    // 说明只写「跟谁比、差在哪」。为什么会这样是**所有落后行共通**的道理，
+    // 每行重复一遍就是四行一模一样的长句，把表撑开还没多给一点信息 ——
+    // 那句话放表底说一次就够。
     rs.forEach(r=>{if(r.sha!==newest)stale.push(Object.assign({},r,{state:'STALE',
-      detail:'本次构建拿到 '+r.sha+'；'+fmtTs(nFirst)+' 之后发的站点拿到的是 '
-             +newest+'。同一个分支名，中间有人推了新提交，这台上的是旧代码。'}));});
+      newest:newest,newestAt:nFirst,
+      detail:'最新是 '+newest+'（'+fmtTs(nFirst)+' 起）'}));});
   });
   d.summary.STALE=stale.length||undefined;
   // 色块也要跟着变色。否则「需要处理」里写着 AR012 代码落后，滚到网格里它却是绿的，
@@ -1320,13 +1323,26 @@ function render(d){
        '<tr><th>状态</th><th>站点</th><th>任务</th><th>分支/tag</th><th>SHA</th>'+
        '<th>构建时间</th><th>说明</th></tr>';
     bad.sort((a,b)=>BAD.indexOf(a.state)-BAD.indexOf(b.state)||(b.ts||0)-(a.ts||0));
+    // 构建号、时间、SHA 现在都有自己的列了，说明里再写一遍纯属占地方。
+    // 落后行例外：它说明里的时间指的是**另一次构建**（最新那批什么时候开始的），
+    // 不是本行的构建时间，删掉就看不懂了。
+    const brief=r=>r.state==='STALE'?r.detail
+      :(String(r.detail||'').replace(/^#\d+\s*/,'')
+        .replace(/\s*\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?\s*/,' ').trim()||'—');
     bad.forEach(r=>{h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
       (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
       (r.url?'<a href="'+esc(r.url)+'" target="_blank">'+esc(r.job||'-')+'</a>':esc(r.job||'-'))+
       '</td><td>'+esc(r.actual||r.expect||'—')+'</td><td><code>'+esc(r.sha||'—')+'</code></td>'+
       '<td>'+esc(r.time||'—')+(r.num?' <small>#'+r.num+'</small>':'')+'</td>'+
-      '<td>'+esc(r.detail)+'</td></tr>';});
-    h+='</table></div></div>';
+      '<td>'+esc(brief(r))+'</td></tr>';});
+    h+='</table></div>';
+    if(stale.length){
+      h+='<div class="sub" style="margin:10px 0 0">「代码落后」＝同一个分支名下出现了'+
+         '不止一个 SHA。分支是可变指针，这些站点构建时分支顶端还没有后来的提交，'+
+         '所以分支名对、代码是旧的。要么重发这几个，要么去 GitLab 比一下那几个提交'+
+         '跟它们有没有关系。</div>';
+    }
+    h+='</div>';
   }
 
   h+='<div class="card">';
