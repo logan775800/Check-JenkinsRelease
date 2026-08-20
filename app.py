@@ -907,10 +907,45 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                              time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"], actual=actual,
                              dur=b["dur"], url=b["url"]))
 
-    # ── 后台：另一套 Jenkins，不按站点发 ─────────────────────────────
-    # 这里刻意**不**造出「每个站点一行 Admin」——后台是整个平台一套，
-    # 硬塞进站点网格会让人以为它是按站点发的，那是编出来的信息。
-    # 一个 job 一行，和它在那边的实际粒度一致。
+    # ── 后台：另一套 Jenkins，两步流程 ───────────────────────────────
+    # 实测 admin_ALL 视图里 70 个 job 全是 AR{编号}-admin-{国家}-{站点} 命名，
+    # 也就是**后台部署确实是按站点一个个点的**。所以这里按站点核对：
+    # 发布单列了哪些站点，就逐站点看它的 admin job 在时间窗内跑没跑。
+    # 70 个站点手工点，漏一个太正常了 —— 这正是这工具该抓的东西。
+    # 版本只在 build_admin 那一步有，单独一行。
+    def _admin_judge(base, e, expect_val, is_build):
+        """一个后台 job 的判定。构建比版本，部署只看跑没跑。"""
+        inwin = sorted([x for x in e["builds"] if frm <= x["ts"] < to],
+                       key=lambda x: x["ts"], reverse=True)
+        if not inwin:
+            cut = e["trunc"] and e["builds"] and min(x["ts"] for x in e["builds"]) > frm
+            if cut:
+                truncated.add(base["job"])
+            return dict(base, state="MISS",
+                        detail=("最近 %d 次构建都晚于时间窗，可能没查全（不一定真的没发）"
+                                % MAX_BUILDS_PER_JOB) if cut
+                        else ("时间窗内没构建过" if is_build else "时间窗内没执行过后台部署"))
+        b = inwin[0]
+        actual = b["want"] or b["got"]
+        if b["result"] == "BUILDING":
+            st, detail = "RUN", f"#{b['num']} 正在{'构建' if is_build else '部署'}中"
+        elif b["result"] != "SUCCESS":
+            st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
+        elif not is_build:
+            # 部署 job 部署的是 build_admin 产出的那份制品，本身没有版本参数。
+            # 拿它比版本会全判「版本未知」，纯噪音 —— 版本对不对由构建那行负责。
+            st, detail = "OK", f"#{b['num']} 已执行 {b['time']}  by {b['who']}"
+        elif expect_val and not actual:
+            st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录版本参数，无法核对"
+        elif expect_val and actual and normalize_ref(actual) != expect_val:
+            st, detail = "VER", f"#{b['num']} 期望 {expect_val}，实际 {actual}"
+        else:
+            st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
+        return dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
+                    time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"],
+                    actual=actual if is_build else "", dur=b["dur"],
+                    url=b["url"] or base.get("url", ""))
+
     for c in comps:
         if c["name"] != ADMIN_COMP:
             continue
@@ -924,61 +959,60 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
             warns.append("发布单里要发后台，但这次一条后台数据都没拉到（原因见上），"
                          "**后台等于没核对**。后台发没发请人工确认。")
             continue
-        for jobname in ajobs:
-            if jobname not in amap:
-                continue          # 这个 job 没拉到，上面已单独告警，别造行
 
-            # 构建那一步才带版本号；部署 job 只是点 Build Now，没有版本可比。
-            # 拿部署 job 去比版本会全判「版本未知」，那是纯噪音。
-            is_build = (jobname == ADMIN_BUILD_JOB)
-            e = amap.get(jobname)
-            base = {"site": "后台构建" if is_build else "后台部署",
-                    "siteName": jobname, "comp": ADMIN_COMP,
-                    "compKey": c["key"], "group": c["group"], "onlySite": "",
-                    "view": ADMIN_VIEW, "job": jobname, "jobSuffix": "",
-                    "expect": c["expect"] if is_build else "", "url": (e or {}).get("url", "")}
-            if e is None:
-                rows.append(dict(base, state="NOJOB", detail="后台 Jenkins 没取到这个任务"))
+        # 1) 构建：版本号输在这里
+        if ADMIN_BUILD_JOB in amap:
+            e = amap[ADMIN_BUILD_JOB]
+            rows.append(_admin_judge(
+                {"site": "后台构建", "siteName": ADMIN_BUILD_JOB, "comp": ADMIN_COMP,
+                 "compKey": c["key"], "group": c["group"], "onlySite": "", "view": ADMIN_VIEW,
+                 "job": ADMIN_BUILD_JOB, "jobSuffix": "", "expect": c["expect"],
+                 "url": e.get("url", "")}, e, expect, True))
+
+        # 2) 部署：按站点。用和 AR 那套同一个 site_of()，命名规约是一样的。
+        by_site = {}
+        loose = []
+        for name in ajobs:
+            if name == ADMIN_BUILD_JOB or name not in amap:
                 continue
-            inwin = sorted([x for x in e["builds"] if frm <= x["ts"] < to],
-                           key=lambda x: x["ts"], reverse=True)
-            if not inwin:
-                cut = e["trunc"] and e["builds"] and min(x["ts"] for x in e["builds"]) > frm
-                if cut:
-                    truncated.add(jobname)
-                rows.append(dict(base, state="MISS",
-                                 detail=("最近 %d 次构建都晚于时间窗，可能没查全（不一定真的没发）"
-                                         % MAX_BUILDS_PER_JOB) if cut
-                                 else ("时间窗内没构建过" if is_build else "时间窗内没执行过部署")))
+            s = site_of(name)
+            (by_site.setdefault(s, []).append(name) if s else loose.append(name))
+        for s in sites:
+            jn = by_site.get(s)
+            common = {"site": s, "siteName": disp.get(s, ""), "comp": ADMIN_COMP,
+                      "compKey": c["key"], "group": c["group"], "onlySite": "",
+                      "view": ADMIN_VIEW, "expect": "", "jobSuffix": ""}
+            if not jn:
+                rows.append(dict(common, job="", state="NOJOB",
+                                 detail="后台没有这个站点的部署任务"))
                 continue
-            b = inwin[0]
-            actual = b["want"] or b["got"]
-            if b["result"] == "BUILDING":
-                st, detail = "RUN", f"#{b['num']} 正在{'构建' if is_build else '部署'}中"
-            elif b["result"] != "SUCCESS":
-                st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
-            elif not is_build:
-                # 部署 job：跑过且成功就是达成。这里不谈版本 ——
-                # 它部署的是 build_admin 产出的那份制品，版本对不对由构建那行负责。
-                st = "OK"
-                detail = f"#{b['num']} 已执行 {b['time']}  by {b['who']}"
-            elif expect and not actual:
-                st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录版本参数，无法核对"
-            elif expect and actual and normalize_ref(actual) != expect:
-                st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
-            else:
-                st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
-            rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
-                             time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"],
-                             actual=actual if is_build else "", dur=b["dur"],
-                             url=b["url"] or base["url"]))
-        # 构建成功但一个部署都没跑 —— 最容易漏的一步：制品打好了，忘了去点部署。
+            for name in jn:
+                e = amap[name]
+                rows.append(_admin_judge(
+                    dict(common, job=name, url=e.get("url", ""),
+                         jobSuffix=name if len(jn) > 1 else ""), e, "", False))
+        # 名字不合 AR 规约的部署 job：照原样列出来，别静默丢掉
+        for name in loose:
+            e = amap[name]
+            rows.append(_admin_judge(
+                {"site": "后台部署", "siteName": name, "comp": ADMIN_COMP,
+                 "compKey": c["key"], "group": c["group"], "onlySite": "", "view": ADMIN_VIEW,
+                 "job": name, "jobSuffix": "", "expect": "", "url": e.get("url", "")},
+                e, "", False))
+
         arows = [x for x in rows if x["comp"] == ADMIN_COMP]
+        # 后台上有、但这次发布单没列的站点：不核对，但要说一声 ——
+        # 「这次没发」和「漏发了」是两回事，只有他自己知道是哪种。
+        extra = sorted(set(by_site) - set(sites))
+        if extra:
+            warns.append("后台还有 %d 个站点这次没在发布单里，未核对：%s%s"
+                         % (len(extra), "、".join(extra[:12]), "…" if len(extra) > 12 else ""))
+        # 构建成功但一个站点都没部署 —— 最容易漏的一步：制品打好了，忘了去点。
         built_ok = any(x["site"] == "后台构建" and x["state"] == "OK" for x in arows)
-        deployed = [x for x in arows if x["site"] == "后台部署" and x["state"] == "OK"]
-        if built_ok and ajobs and not deployed:
-            warns.append("后台 build_admin 这一版构建成功了，但「%s」视图里**一个部署都没执行**。"
-                         "制品打好了没发出去 —— 去点 Build Now。" % ADMIN_DEPLOY_VIEW)
+        if built_ok and not any(x["state"] == "OK" and x["site"] != "后台构建" for x in arows):
+            warns.append("后台 %s 这一版构建成功了，但**一个站点的部署都没执行**。"
+                         "制品打好了没发出去 —— 去 %s 视图里点 Build Now。"
+                         % (ADMIN_BUILD_JOB, ADMIN_DEPLOY_VIEW))
 
     summary = {}
     for r in rows:

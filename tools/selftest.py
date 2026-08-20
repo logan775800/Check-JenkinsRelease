@@ -292,6 +292,7 @@ check("错拼组件 + 分组写法仍能解析",
 print("\n== 11. 后台(Admin)走第二套 Jenkins ==")
 ADMIN_MANIFEST = """【发布站点】
 （印度）AR001→site1
+（巴西）AR002→site2
 
 【发布步骤】
     web    →   分支：master_V3.08_001
@@ -308,10 +309,13 @@ check("没配时给出「不在这套 Jenkins」提示", any("不在这套" in x
 app.ADMIN_URL, app.ADMIN_USER, app.ADMIN_TOKEN = "https://admin-fake", "u", "t"
 app.ADMIN_JOBS = []          # 不配 job 名单：应当自动去那台上列
 # 真实流程：版本号输在 build_admin 上，admin_ALL 视图里的 job 只是点 Build Now 部署。
+# 实测：admin_ALL 视图里 70 个 job 全是 AR{编号}-admin-{国家}-{站点} 命名，
+# 也就是后台部署确实按站点点。版本只在 build_admin 那一步。
 ADMIN_JOBDATA = {
     "build_admin": [mkbuild(1452, NOW, tag="master_V3.09_308", param="VERSION")],
-    "saasdemo-admin-印度": [mkbuild(149, NOW, param=None, rev=False)],   # 部署 job：无版本参数
-    "saasdemo-admin-越南": [mkbuild(134, NOW, param=None, rev=False)],
+    "AR001-admin-印度-82Bet": [mkbuild(149, NOW, param=None, rev=False)],
+    "AR002-admin-巴西-pop678": [mkbuild(134, NOW - 30 * DAY, param=None, rev=False)],  # 漏发
+    "saasdemo-admin-越南": [mkbuild(9, NOW, param=None, rev=False)],   # 不合 AR 规约
 }
 admin_calls = []
 _plain_get = app.jenkins_get
@@ -339,18 +343,24 @@ check("配好后不再提示「不在这套」", not any("不在这套" in x for
 
 r11 = run(ADMIN_MANIFEST)
 arows = [x for x in r11["rows"] if x["comp"] == app.ADMIN_COMP]
-check("构建 + 两个部署 job 共三行", len(arows) == 3, [(x["site"], x["siteName"]) for x in arows])
+check("构建 1 行 + 按站点 2 行 + 散 job 1 行", len(arows) == 4,
+      [(x["site"], x["job"]) for x in arows])
 bld = [x for x in arows if x["siteName"] == "build_admin"]
-dep = [x for x in arows if x["site"] == "后台部署"]
+dep = [x for x in arows if x["site"] in ("AR001", "AR002")]
 check("build_admin 归到「后台构建」", bld and bld[0]["site"] == "后台构建", arows)
 check("构建那行读得出版本号", bld and bld[0]["actual"] == "master_V3.09_308", bld)
 check("版本对 → 构建判 OK", bld and bld[0]["state"] == "OK", bld)
-check("两个部署 job 都出行", len(dep) == 2, dep)
-check("部署 job 跑过就判 OK（不比版本）",
-      all(x["state"] == "OK" for x in dep), dep)
-check("部署 job 不显示版本（它本来就没有）",
-      all(not x["actual"] for x in dep), dep)
-check("部署 job 说明写「已执行」", all("已执行" in x["detail"] for x in dep), dep)
+check("部署按站点出行（AR001/AR002）", len(dep) == 2, dep)
+check("跑过的站点判 OK", [x["state"] for x in dep if x["site"] == "AR001"] == ["OK"], dep)
+check("没跑的站点判 MISS（这就是漏发）",
+      [x["state"] for x in dep if x["site"] == "AR002"] == ["MISS"], dep)
+check("漏发说明写「没执行过后台部署」",
+      any("没执行过后台部署" in x["detail"] for x in dep if x["site"] == "AR002"), dep)
+check("不合 AR 规约的 job 不丢，照原样列",
+      any(x["job"] == "saasdemo-admin-越南" for x in arows), arows)
+check("部署行不显示版本（它本来就没有）", all(not x.get("actual") for x in dep), dep)
+check("跑过的说明写「已执行」",
+      all("已执行" in x["detail"] for x in dep if x["state"] == "OK"), dep)
 
 # 版本打错：只该构建那行变红，部署行不受影响
 reset()
@@ -360,17 +370,17 @@ av = [x for x in r_ver["rows"] if x["comp"] == app.ADMIN_COMP]
 check("版本不对 → 构建判 VER",
       [x["state"] for x in av if x["site"] == "后台构建"] == ["VER"], av)
 check("构建版本错不影响部署行判定",
-      all(x["state"] == "OK" for x in av if x["site"] == "后台部署"), av)
+      [x["state"] for x in av if x["site"] == "AR001"] == ["OK"], av)
 ADMIN_JOBDATA["build_admin"] = [mkbuild(1452, NOW, tag="master_V3.09_308", param="VERSION")]
 
 # 构建了但一个都没部署 —— 最容易漏的一步
 reset()
 _keep = {k: v for k, v in ADMIN_JOBDATA.items()}
-ADMIN_JOBDATA["saasdemo-admin-印度"] = [mkbuild(149, NOW - 30 * DAY, param=None, rev=False)]
-ADMIN_JOBDATA["saasdemo-admin-越南"] = [mkbuild(134, NOW - 30 * DAY, param=None, rev=False)]
+for _k in ("AR001-admin-印度-82Bet", "AR002-admin-巴西-pop678", "saasdemo-admin-越南"):
+    ADMIN_JOBDATA[_k] = [mkbuild(1, NOW - 30 * DAY, param=None, rev=False)]
 r_nodep = run(ADMIN_MANIFEST)
 check("构建成功但没部署要单独告警",
-      any("一个部署都没执行" in x for x in r_nodep["warnings"]), r_nodep["warnings"])
+      any("部署都没执行" in x for x in r_nodep["warnings"]), r_nodep["warnings"])
 ADMIN_JOBDATA.clear(); ADMIN_JOBDATA.update(_keep)
 reset()
 check("用的是后台自己的凭据，不是 AR 那套",
