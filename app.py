@@ -1355,7 +1355,10 @@ function render(d){
     h+='<div class="grid">';
     rows.forEach(r=>{
       const diff=r.actual&&norm(r.actual)!==norm(c.expect);
-      h+='<div class="cell s-'+r.state+'" title="'+esc(r.job+'\n'+r.detail)+'">'+
+      const isStale=staleKey.has(r.compKey+'|'+r.site+'|'+r.job);
+      const st=isStale?'STALE':r.state;
+      h+='<div class="cell s-'+st+'" title="'+esc(r.job+'\n'+
+         (isStale?'代码落后：SHA '+r.sha:r.detail))+'">'+
       '<b>'+esc(r.site)+(r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</b>'+
       '<div class="br'+(diff?' diff':'')+'">'+esc(r.actual||'—')+'</div>'+
       '<span class="st '+st+'" style="font-size:11.5px">'+LABEL[st]+'</span>'+
