@@ -371,9 +371,12 @@ check("漏发说明写「没执行过后台部署」",
       any("没执行过后台部署" in x["detail"] for x in dep if x["site"] == "AR002"), dep)
 check("不合 AR 规约的 job 不丢，照原样列",
       any(x["job"] == "saasdemo-admin-越南" for x in arows), arows)
-check("部署行不显示版本（它本来就没有）", all(not x.get("actual") for x in dep), dep)
-check("跑过的说明写「已执行」",
-      all("已执行" in x["detail"] for x in dep if x["state"] == "OK"), dep)
+# 部署 job 自己没有版本参数，但它装的就是 build_admin 那份制品 ——
+# 所以每行都要显示「它装的是哪一版」，而不是一个「—」。
+check("部署行显示它装的那一版",
+      [x["actual"] for x in dep if x["state"] == "OK"] == ["master_V3.09_308"], dep)
+check("说明写清楚装的是哪次构建",
+      all("装的是 build_admin #1452" in x["detail"] for x in dep if x["state"] == "OK"), dep)
 
 # 版本打错：只该构建那行变红，部署行不受影响
 reset()
@@ -382,9 +385,39 @@ r_ver = run(ADMIN_MANIFEST)
 av = [x for x in r_ver["rows"] if x["comp"] == app.ADMIN_COMP]
 check("版本不对 → 构建判 VER",
       [x["state"] for x in av if x["site"] == "后台构建"] == ["VER"], av)
-check("构建版本错不影响部署行判定",
-      [x["state"] for x in av if x["site"] == "AR001"] == ["OK"], av)
+# build_admin 打错版本 → 装了它的站点当然也是错版本，必须一起红。
+# 早先误以为「部署行不该受构建版本影响」，那是错的：部署装的就是那一版。
+check("构建版本错 → 装了它的站点也判 VER",
+      [x["state"] for x in av if x["site"] == "AR001"] == ["VER"], av)
+check("并说清这个站点还是旧版",
+      any("还是旧版" in x["detail"] for x in av if x["site"] == "AR001"), av)
 ADMIN_JOBDATA["build_admin"] = [mkbuild(1452, NOW, tag="master_V3.09_308", param="VERSION")]
+
+# ★ 最要命的一种：部署跑在构建**之前** —— 那它装的是上一版制品。
+# 部署 job 本身是绿色成功的，不比时间的话报告全绿，线上却有站点还是旧后台。
+reset()
+ADMIN_JOBDATA["build_admin"] = [
+    mkbuild(1452, NOW, tag="master_V3.09_308", param=None),          # 新版：10:00
+    mkbuild(1451, NOW - 3600, tag="master_V3.08_001", param=None),   # 旧版：09:00
+]
+ADMIN_JOBDATA["AR001-admin-印度-82Bet"] = [mkbuild(133, NOW + 600, param=None, rev=False)]   # 10:10 构建后
+ADMIN_JOBDATA["AR002-admin-巴西-pop678"] = [mkbuild(115, NOW - 1800, param=None, rev=False)]  # 09:30 构建前
+r_old = run(ADMIN_MANIFEST)
+ao = [x for x in r_old["rows"] if x["comp"] == app.ADMIN_COMP]
+a1 = [x for x in ao if x["site"] == "AR001"]
+a2 = [x for x in ao if x["site"] == "AR002"]
+check("构建之后部署的站点：拿到新版，判 OK",
+      a1 and a1[0]["state"] == "OK" and a1[0]["actual"] == "master_V3.09_308", a1)
+check("★构建之前部署的站点：装的是上一版，必须判 VER",
+      a2 and a2[0]["state"] == "VER", a2)
+check("★并指出它装的是哪一版（旧的那版）",
+      a2 and a2[0]["actual"] == "master_V3.08_001", a2)
+check("★这个站点的部署本身是成功的，别因为绿就放过",
+      a2 and a2[0]["result"] == "SUCCESS", a2)
+reset()
+ADMIN_JOBDATA["build_admin"] = [mkbuild(1452, NOW, tag="master_V3.09_308", param="VERSION")]
+ADMIN_JOBDATA["AR001-admin-印度-82Bet"] = [mkbuild(149, NOW, param=None, rev=False)]
+ADMIN_JOBDATA["AR002-admin-巴西-pop678"] = [mkbuild(134, NOW - 30 * DAY, param=None, rev=False)]
 
 # 构建了但一个都没部署 —— 最容易漏的一步
 reset()

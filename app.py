@@ -913,8 +913,24 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
     # 发布单列了哪些站点，就逐站点看它的 admin job 在时间窗内跑没跑。
     # 70 个站点手工点，漏一个太正常了 —— 这正是这工具该抓的东西。
     # 版本只在 build_admin 那一步有，单独一行。
-    def _admin_judge(base, e, expect_val, is_build):
-        """一个后台 job 的判定。构建比版本，部署只看跑没跑。"""
+    def _artifact_at(admin_builds, ts):
+        """这次部署装的是哪一版制品：取**它执行之前**最后一次成功的 build_admin。
+
+        部署 job 自己没有版本参数，它装的就是 build_admin 当时产出的那份。
+        所以「这个站点发的是哪一版」= 部署时刻往前找最近一次成功构建。
+
+        这一步不是为了好看。真正要抓的是：**部署跑在构建之前**的站点 ——
+        它装的是上一版制品，而它的部署 job 本身是绿色成功的，
+        不比时间的话报告全绿，线上却有站点还是旧后台。
+        和「分支名一样但代码不一样」是同一类坑，只是这里能精确判定。
+        """
+        for b in admin_builds:          # 已按时间倒序
+            if b["ts"] <= ts:
+                return b
+        return None
+
+    def _admin_judge(base, e, expect_val, is_build, admin_builds=None):
+        """一个后台 job 的判定。构建比版本；部署比「它装的那版制品」的版本。"""
         inwin = sorted([x for x in e["builds"] if frm <= x["ts"] < to],
                        key=lambda x: x["ts"], reverse=True)
         if not inwin:
@@ -932,9 +948,29 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
         elif b["result"] != "SUCCESS":
             st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
         elif not is_build:
-            # 部署 job 部署的是 build_admin 产出的那份制品，本身没有版本参数。
-            # 拿它比版本会全判「版本未知」，纯噪音 —— 版本对不对由构建那行负责。
-            st, detail = "OK", f"#{b['num']} 已执行 {b['time']}  by {b['who']}"
+            # 部署 job 没有自己的版本参数，它装的是 build_admin 当时产出的那份制品。
+            # 所以回头去找「它执行之前最后一次成功构建」，那才是这个站点真正的版本。
+            art = _artifact_at(admin_builds or [], b["ts"])
+            if art is None:
+                st = "NOVER"
+                detail = (f"#{b['num']} 已执行 {b['time']}，但查不到它之前的 build_admin 构建"
+                          f"（最近 {MAX_BUILDS_PER_JOB} 次里没有），装的是哪一版说不准")
+                actual = ""
+            else:
+                actual = art["ver"]
+                if expect_val and actual and normalize_ref(actual) != expect_val:
+                    st = "VER"
+                    detail = (f"#{b['num']} {b['time']} 装的是 build_admin #{art['num']}"
+                              f"（{actual}），不是发布单要求的 {expect_val}"
+                              f" —— 这个站点的后台还是旧版")
+                elif expect_val and not actual:
+                    st = "NOVER"
+                    detail = (f"#{b['num']} {b['time']} 装的是 build_admin #{art['num']}，"
+                              f"但那次构建没记录版本，无法核对")
+                else:
+                    st = "OK"
+                    detail = (f"#{b['num']} {b['time']} 装的是 build_admin #{art['num']}"
+                              f"（{actual or '版本未记录'}）  by {b['who']}")
         elif expect_val and not actual:
             st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录版本参数，无法核对"
         elif expect_val and actual and normalize_ref(actual) != expect_val:
@@ -943,8 +979,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
             st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
         return dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
                     time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"],
-                    actual=actual if is_build else "", dur=b["dur"],
-                    url=b["url"] or base.get("url", ""))
+                    actual=actual, dur=b["dur"], url=b["url"] or base.get("url", ""))
 
     for c in comps:
         if c["name"] != ADMIN_COMP:
@@ -959,6 +994,14 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
             warns.append("发布单里要发后台，但这次一条后台数据都没拉到（原因见上），"
                          "**后台等于没核对**。后台发没发请人工确认。")
             continue
+
+        # build_admin 的历次成功构建，按时间倒序 —— 部署行要靠它回溯自己装的哪一版。
+        admin_builds = []
+        for x in (amap.get(ADMIN_BUILD_JOB) or {}).get("builds", []):
+            if x["result"] == "SUCCESS":
+                admin_builds.append({"ts": x["ts"], "num": x["num"],
+                                     "ver": normalize_ref(x["want"] or x["got"])})
+        admin_builds.sort(key=lambda x: x["ts"], reverse=True)
 
         # 1) 构建：版本号输在这里
         if ADMIN_BUILD_JOB in amap:
@@ -981,7 +1024,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
             jn = by_site.get(s)
             common = {"site": s, "siteName": disp.get(s, ""), "comp": ADMIN_COMP,
                       "compKey": c["key"], "group": c["group"], "onlySite": "",
-                      "view": ADMIN_VIEW, "expect": "", "jobSuffix": ""}
+                      "view": ADMIN_VIEW, "expect": c["expect"], "jobSuffix": ""}
             if not jn:
                 rows.append(dict(common, job="", state="NOJOB",
                                  detail="后台没有这个站点的部署任务"))
@@ -989,16 +1032,17 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
             for name in jn:
                 e = amap[name]
                 rows.append(_admin_judge(
-                    dict(common, job=name, url=e.get("url", ""),
-                         jobSuffix=name if len(jn) > 1 else ""), e, "", False))
+                    dict(common, job=name, url=e.get("url", ""), expect=c["expect"],
+                         jobSuffix=name if len(jn) > 1 else ""),
+                    e, expect, False, admin_builds))
         # 名字不合 AR 规约的部署 job：照原样列出来，别静默丢掉
         for name in loose:
             e = amap[name]
             rows.append(_admin_judge(
                 {"site": "后台部署", "siteName": name, "comp": ADMIN_COMP,
                  "compKey": c["key"], "group": c["group"], "onlySite": "", "view": ADMIN_VIEW,
-                 "job": name, "jobSuffix": "", "expect": "", "url": e.get("url", "")},
-                e, "", False))
+                 "job": name, "jobSuffix": "", "expect": c["expect"], "url": e.get("url", "")},
+                e, expect, False, admin_builds))
 
         arows = [x for x in rows if x["comp"] == ADMIN_COMP]
         # 后台上有、但这次发布单没列的站点：不核对，但要说一声 ——
