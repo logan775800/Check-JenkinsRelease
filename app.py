@@ -1492,6 +1492,28 @@ def probe_admin():
         else:
             print("OK，返回：%s" % json.dumps(data, ensure_ascii=False)[:200])
         waf = False
+    # 光说「连上了」不够 —— 真正要确认的是**版本读不读得出来**。
+    # 读不出来会判成「版本未知」，那等于后台的版本核对是空的。
+    print("\n--- 构建那一步实际读到什么 ---")
+    try:
+        d = jenkins_get("/job/" + urllib.parse.quote(ADMIN_BUILD_JOB, safe="") + "/api/json"
+                        + _q(_BUILD_FIELDS % 3), ADMIN_USER, ADMIN_TOKEN, timeout=60, base=ADMIN_URL)
+        bl = d.get("builds") or []
+        if not bl:
+            print("%s 没有构建记录" % ADMIN_BUILD_JOB)
+        for raw in bl[:3]:
+            b = read_build(raw)
+            src = "参数" if b["want"] else ("Git分支" if b["got"] else "读不到")
+            print("  #%s %s %s  版本=%s（来源:%s）  SHA=%s  by %s"
+                  % (b["num"], b["time"], b["result"],
+                     b["want"] or b["got"] or "(空)", src, b["sha"] or "-", b["who"] or "-"))
+            if b["params"]:
+                print("     参数：%s" % b["params"][:160])
+        if bl and not (read_build(bl[0])["want"] or read_build(bl[0])["got"]):
+            print("  ⚠ 版本读不出来 —— 核对时这一行会显示「版本未知」。"
+                  "把上面「参数：」里那个装版本号的字段名告诉我，加进 read_build 就行。")
+    except Exception as e:
+        print("读不到：%s" % str(getattr(e, "reason", e))[:150])
     if waf:
         # 判成 WAF 拦截时，下一个问题必然是「那加哪个 IP」。别让人再去搜一遍：
         # 容器出网走宿主机 NAT，所以这里查到的就是 Cloudflare 看到的那个源 IP。

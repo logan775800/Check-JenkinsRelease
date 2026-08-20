@@ -349,6 +349,19 @@ bld = [x for x in arows if x["siteName"] == "build_admin"]
 dep = [x for x in arows if x["site"] in ("AR001", "AR002")]
 check("build_admin 归到「后台构建」", bld and bld[0]["site"] == "后台构建", arows)
 check("构建那行读得出版本号", bld and bld[0]["actual"] == "master_V3.09_308", bld)
+
+# build_admin #1452 的真实形态：版本不在参数里，在 Git revision 的分支名上。
+# 这条锁住「没有 TAG/BRANCH 参数也照样读得出版本」——否则后台的版本核对是空的。
+_raw = {"number": 1452, "result": "SUCCESS", "building": False,
+        "timestamp": int(NOW * 1000), "duration": 90000, "url": "u",
+        "actions": [{"lastBuiltRevision": {
+                        "SHA1": "821f5a73e458d3ae1b62de8b12c1e27a4a600eda",
+                        "branch": [{"name": "refs/remotes/origin/master_V3.09_308"}]}},
+                    {"causes": [{"userName": "linke"}]}]}
+_b = app.read_build(_raw)
+check("没有版本参数时从 Git 分支读版本", _b["got"] == "master_V3.09_308", _b)
+check("refs/remotes/origin/ 前缀要剥掉", "refs/" not in _b["got"], _b)
+check("SHA 取前 7 位", _b["sha"] == "821f5a7", _b)
 check("版本对 → 构建判 OK", bld and bld[0]["state"] == "OK", bld)
 check("部署按站点出行（AR001/AR002）", len(dep) == 2, dep)
 check("跑过的站点判 OK", [x["state"] for x in dep if x["site"] == "AR001"] == ["OK"], dep)
