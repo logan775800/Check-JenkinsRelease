@@ -289,7 +289,85 @@ c, w = app.parse_components(GROUPED_TYPO)
 check("错拼组件 + 分组写法仍能解析",
       len(c) == 1 and c[0]["name"] == "WebIntranetApi" and c[0]["group"] == "中台", c)
 
-print("\n== 11. 并发去重 ==")
+print("\n== 11. 后台(Admin)走第二套 Jenkins ==")
+ADMIN_MANIFEST = """【发布站点】
+（印度）AR001→site1
+
+【发布步骤】
+    web    →   分支：master_V3.08_001
+    admin  →   tag: master_V3.09_308
+"""
+
+# --- 没配第二套时：必须还是原来那句提示，不能报错也不能假装核对了 ---
+reset()
+c, w = app.parse_components(ADMIN_MANIFEST)
+check("没配后台 Jenkins 时不当成组件", all(x["name"] != app.ADMIN_COMP for x in c), c)
+check("没配时给出「不在这套 Jenkins」提示", any("不在这套" in x for x in w), w)
+
+# --- 配上第二套 ---
+app.ADMIN_URL, app.ADMIN_USER, app.ADMIN_TOKEN = "https://admin-fake", "u", "t"
+app.ADMIN_JOBS = ["Sit-Admin", "sit-admin-非saas彩票"]
+ADMIN_JOBDATA = {
+    "Sit-Admin": [mkbuild(7, NOW, tag="master_V3.09_308", param="BRANCH")],
+    "sit-admin-非saas彩票": [mkbuild(3, NOW, tag="master_V3.08_001", param="BRANCH")],
+}
+admin_calls = []
+_plain_get = app.jenkins_get
+
+
+def get_with_admin(path, user, token_, timeout=180, base=None):
+    if base == "https://admin-fake":
+        admin_calls.append((path, user, token_))
+        name = urllib.parse.unquote(path.split("/job/")[1].split("/api/json")[0])
+        if name not in ADMIN_JOBDATA:
+            raise RuntimeError("no such job " + name)
+        return {"builds": ADMIN_JOBDATA[name][:app.MAX_BUILDS_PER_JOB]}
+    return _plain_get(path, user, token_, timeout)
+
+
+app.jenkins_get = get_with_admin
+reset()
+c, w = app.parse_components(ADMIN_MANIFEST)
+check("配好后 admin 解析成组件", any(x["name"] == app.ADMIN_COMP for x in c), c)
+check("配好后不再提示「不在这套」", not any("不在这套" in x for x in w), w)
+
+r11 = run(ADMIN_MANIFEST)
+arows = [x for x in r11["rows"] if x["comp"] == app.ADMIN_COMP]
+check("两个后台 job 各出一行", len(arows) == 2, arows)
+check("BRANCH 参数能读出版本",
+      any(x["actual"] == "master_V3.09_308" for x in arows), arows)
+check("版本对的判 OK",
+      [x["state"] for x in arows if x["siteName"] == "Sit-Admin"] == ["OK"], arows)
+check("版本不对的判 VER",
+      [x["state"] for x in arows if x["siteName"] == "sit-admin-非saas彩票"] == ["VER"], arows)
+check("后台行不伪造成按站点发（site 恒为「后台」）",
+      {x["site"] for x in arows} == {"后台"}, arows)
+check("用的是后台自己的凭据，不是 AR 那套",
+      admin_calls and all(u == "u" and t == "t" for _p, u, t in admin_calls), admin_calls)
+check("AR 站点照常核对，没被后台挤掉",
+      any(x["comp"] == "Pages" and x["site"] == "AR001" for x in r11["rows"]), r11["rows"])
+
+# --- 后台某个 job 拉不到：不能把整块后台核对带崩 ---
+reset()
+del admin_calls[:]
+
+
+def get_admin_flaky(path, user, token_, timeout=180, base=None):
+    if base == "https://admin-fake" and "Sit-Admin/api" in path.replace("%2D", "-"):
+        raise RuntimeError("connection refused")
+    return get_with_admin(path, user, token_, timeout, base)
+
+
+app.jenkins_get = get_admin_flaky
+r11b = run(ADMIN_MANIFEST)
+arows_b = [x for x in r11b["rows"] if x["comp"] == app.ADMIN_COMP]
+check("一个后台 job 挂了，另一个照常出结果", len(arows_b) >= 1, arows_b)
+check("拉失败要告警，不能静默", any("后台 Jenkins" in x for x in r11b["warnings"]), r11b["warnings"])
+app.jenkins_get = _plain_get
+app.ADMIN_URL = app.ADMIN_USER = app.ADMIN_TOKEN = ""
+app.ADMIN_JOBS = ["Sit-Admin"]
+
+print("\n== 12. 并发去重 ==")
 reset()
 plain = app.jenkins_get
 

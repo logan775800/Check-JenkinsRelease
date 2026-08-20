@@ -59,6 +59,28 @@ FETCH_CONCURRENCY = max(1, int(os.environ.get("JENKINS_FETCH_CONCURRENCY", "6"))
 BULK_THRESHOLD = int(os.environ.get("JENKINS_BULK_THRESHOLD", "200"))
 MAX_BODY = 2 * 1024 * 1024  # /api/check 请求体上限。发布单再长也就几十 KB
 
+# ── 第二套 Jenkins：后台(Admin)───────────────────────────────────────
+# 后台不在 AR 那套 Jenkins 上，是独立的一台（Windows，job 叫 Sit-Admin 之类），
+# 命名规约、参数名、凭据全都不一样。以前发布单里的「admin → xxx」直接被跳过不核对，
+# 于是每次发版后台发没发、发的哪版，得另外找人问。
+#
+# 配置齐了才启用；没配就退回原来那句「不在这套 Jenkins 上」提示，不影响主流程。
+# 用**独立凭据**：那台 Jenkins 上的账号和 AR 这套没关系，也不该共用 Token。
+ADMIN_URL = os.environ.get("ADMIN_JENKINS_URL", "").rstrip("/")
+ADMIN_USER = os.environ.get("ADMIN_JENKINS_USER", "")
+ADMIN_TOKEN = os.environ.get("ADMIN_JENKINS_TOKEN", "")
+# 要核对哪几个 job，逗号分隔。后台有 saas / 非saas 等多个变体，一次发版可能都要发。
+ADMIN_JOBS = [j.strip() for j in
+              os.environ.get("ADMIN_JENKINS_JOBS", "Sit-Admin").split(",") if j.strip()]
+
+
+ADMIN_COMP = "Admin"       # 内部组件名，页面上单独成一块
+ADMIN_VIEW = "后台（另一套 Jenkins）"
+
+
+def admin_ready():
+    return bool(ADMIN_URL and ADMIN_USER and ADMIN_TOKEN and ADMIN_JOBS)
+
 # job 命名规约：AR{编号}-{组件}-{国家}-{站点名}
 # 发布单里写的组件名和 Jenkins 里的组件名对不上，这里做别名映射。
 # 键一律用 canon() 归一后的形式：转小写、去掉空格/连字符/下划线。
@@ -116,8 +138,9 @@ def _lock_for(key):
 
 
 # ---------------------------------------------------------------- Jenkins 访问
-def jenkins_get(path, user, token_, timeout=180):
-    url = JENKINS_URL + path
+def jenkins_get(path, user, token_, timeout=180, base=None):
+    """base 不传就是 AR 那套 Jenkins；后台那套把它的地址传进来。"""
+    url = (base or JENKINS_URL) + path
     req = urllib.request.Request(url)
     token = base64.b64encode(f"{user}:{token_}".encode("ascii")).decode("ascii")
     req.add_header("Authorization", "Basic " + token)
@@ -266,6 +289,37 @@ def fetch_builds(names, user, token_, force=False):
                 b["builds"].update(got)
             for n in still:
                 out[n] = got.get(n) or {"ts": time.time(), "builds": [], "trunc": False}
+    return out, warns
+
+
+def fetch_admin_builds(force=False):
+    """拉后台那套 Jenkins 上配置的几个 job 的构建历史。
+
+    单独一套缓存和凭据：那台机器和 AR 这套没有任何关系，权限也不共用。
+    某个 job 拉失败不影响其余的 —— 后台常有 saas/非saas 多个变体，
+    挂一个不该让整块后台核对都没了。
+    """
+    b = _bucket("__admin__")
+    now = time.time()
+    out, warns = {}, []
+    for name in ADMIN_JOBS:
+        e = b["builds"].get(name)
+        if not force and e and now - e["ts"] < CACHE_TTL:
+            out[name] = e
+            continue
+        path = "/job/" + urllib.parse.quote(name, safe="") + "/api/json"
+        try:
+            data = jenkins_get(path + _q(_BUILD_FIELDS % MAX_BUILDS_PER_JOB),
+                               ADMIN_USER, ADMIN_TOKEN, timeout=60, base=ADMIN_URL)
+        except Exception as ex:
+            warns.append("后台 Jenkins 的「%s」没拉到：%s"
+                         % (name, str(getattr(ex, "reason", ex))[:120]))
+            continue
+        ent = _entry(data.get("builds"))
+        ent["url"] = ADMIN_URL + "/job/" + urllib.parse.quote(name, safe="") + "/"
+        with _cache_lock:
+            b["builds"][name] = ent
+        out[name] = ent
     return out, warns
 
 
@@ -460,7 +514,8 @@ def resolve_component(raw, fuzzy=False):
     if not key:
         return None, False, 0.0
     if key in NOT_IN_JENKINS:
-        return None, True, 0.0
+        # 后台那套配好了就当成正常组件核对，没配才退回「不在这套 Jenkins」提示
+        return (ADMIN_COMP, False, 0.0) if admin_ready() else (None, True, 0.0)
     name = COMPONENT_ALIAS.get(key)
     if not name:                       # 也允许直接写 Jenkins 里的组件名本身
         for v in set(COMPONENT_ALIAS.values()):
@@ -574,10 +629,11 @@ def read_build(b):
     for a in acts:
         if a.get("parameters"):
             params.extend(a["parameters"])
-    # 参数名不统一：Api/Job/Web 类叫 TAG，Pages 类叫 BRANCH_NAME，两个都试
+    # 参数名不统一：Api/Job/Web 类叫 TAG，Pages 类叫 BRANCH_NAME，
+    # 后台那套（Sit-Admin）叫 BRANCH。三个都试。
     want = ""
     for p in params:
-        if p.get("name") in ("TAG", "BRANCH_NAME"):
+        if p.get("name") in ("TAG", "BRANCH_NAME", "BRANCH"):
             want = p.get("value") or ""
             break
     got, sha = "", ""
@@ -682,6 +738,8 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
     # 分两趟是为了「按需拉」：只有排进计划的 job 才值得花一次请求。
     plan, wanted, nogroup = [], set(), set()
     for c in comps:
+        if c["name"] == ADMIN_COMP:
+            continue          # 后台不按站点发，单独处理（见下面 admin_rows）
         if c.get("site"):
             comp_sites = [s for s in sites if s == c["site"]]
             if not comp_sites:
@@ -762,6 +820,51 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
             rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
                              time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"], actual=actual,
                              dur=b["dur"], url=b["url"]))
+
+    # ── 后台：另一套 Jenkins，不按站点发 ─────────────────────────────
+    # 这里刻意**不**造出「每个站点一行 Admin」——后台是整个平台一套，
+    # 硬塞进站点网格会让人以为它是按站点发的，那是编出来的信息。
+    # 一个 job 一行，和它在那边的实际粒度一致。
+    for c in comps:
+        if c["name"] != ADMIN_COMP:
+            continue
+        expect = normalize_ref(c["expect"])
+        amap, awarns = fetch_admin_builds(force=force)
+        warns.extend(awarns)
+        for jobname in ADMIN_JOBS:
+            e = amap.get(jobname)
+            base = {"site": "后台", "siteName": jobname, "comp": ADMIN_COMP,
+                    "compKey": c["key"], "group": c["group"], "onlySite": "",
+                    "view": ADMIN_VIEW, "job": jobname, "jobSuffix": "",
+                    "expect": c["expect"], "url": (e or {}).get("url", "")}
+            if e is None:
+                rows.append(dict(base, state="NOJOB", detail="后台 Jenkins 没取到这个任务"))
+                continue
+            inwin = sorted([x for x in e["builds"] if frm <= x["ts"] < to],
+                           key=lambda x: x["ts"], reverse=True)
+            if not inwin:
+                cut = e["trunc"] and e["builds"] and min(x["ts"] for x in e["builds"]) > frm
+                if cut:
+                    truncated.add(jobname)
+                rows.append(dict(base, state="MISS",
+                                 detail=("最近 %d 次构建都晚于时间窗，可能没查全（不一定真的没发）"
+                                         % MAX_BUILDS_PER_JOB) if cut else "时间窗内没有构建"))
+                continue
+            b = inwin[0]
+            actual = b["want"] or b["got"]
+            if b["result"] == "BUILDING":
+                st, detail = "RUN", f"#{b['num']} 正在构建中"
+            elif b["result"] != "SUCCESS":
+                st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
+            elif expect and not actual:
+                st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录分支/tag，版本无法核对"
+            elif expect and actual and normalize_ref(actual) != expect:
+                st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
+            else:
+                st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
+            rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
+                             time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"],
+                             actual=actual, dur=b["dur"], url=b["url"] or base["url"]))
 
     summary = {}
     for r in rows:

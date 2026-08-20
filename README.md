@@ -161,6 +161,32 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 | `JENKINS_CACHE_TTL` | 60 | 缓存秒数 |
 | `JENKINS_FETCH_CONCURRENCY` | 6 | 按需拉构建历史的并发数。往上调容易被 Jenkins 前面的 WAF 限速 |
 | `JENKINS_BULK_THRESHOLD` | 200 | 要拉的 job 超过这个数就改用「一次性全量」那条老路 |
+| `ADMIN_JENKINS_URL` / `_USER` / `_TOKEN` / `_JOBS` | 空 | 后台(Admin)那套独立 Jenkins。四项配齐才启用，见下 |
+
+### 后台（Admin）走第二套 Jenkins
+
+后台不在 AR 那套 Jenkins 上，是独立的一台（Windows，job 叫 `Sit-Admin` 之类），
+**命名规约、版本参数名、凭据全都不一样**。以前发布单里的「admin → xxx」直接跳过不核对，
+每次发版后台发没发、发的哪版，得另外找人问。
+
+在 `.env` 里配齐四项就会一起核对：
+
+```bash
+ADMIN_JENKINS_URL=https://后台jenkins地址
+ADMIN_JENKINS_USER=登录名
+ADMIN_JENKINS_TOKEN=在那台的 /me/security/ 生成
+ADMIN_JENKINS_JOBS=Sit-Admin,sit-admin-非saas彩票   # 逗号分隔
+```
+
+几个刻意的取舍：
+
+- **不配就退回原样**（还是提示「不在这套 Jenkins」），不会报错、不影响其余核对。
+- **凭据独立**：那台机器和 AR 这套没关系，不共用 Token。
+- **不伪造成按站点发**：后台是整个平台一套，页面上一个 job 一行、站点栏固定写「后台」。
+  硬塞进站点网格会让人以为它按站点发，那是编出来的信息。
+- **某个 job 拉不到只影响它自己**，其余照常出结果并单独告警 —— 后台常有 saas/非saas
+  多个变体，挂一个不该让整块后台核对都没了。
+- 版本参数名多试一个 **`BRANCH`**（`Sit-Admin` 用的是它，不是 `TAG`/`BRANCH_NAME`）。
 
 ### 取数策略（为什么快了）
 
