@@ -69,9 +69,11 @@ MAX_BODY = 2 * 1024 * 1024  # /api/check 请求体上限。发布单再长也就
 ADMIN_URL = os.environ.get("ADMIN_JENKINS_URL", "").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_JENKINS_USER", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_JENKINS_TOKEN", "")
-# 要核对哪几个 job，逗号分隔。后台有 saas / 非saas 等多个变体，一次发版可能都要发。
+# 要核对哪几个 job，逗号分隔。**留空就自动去那台 Jenkins 上列全部 job** ——
+# 别逼使用者先知道 job 叫什么才能用，那正是他配不出来的那一项。
+# 只有当那台上混着一堆无关 job、核对结果太吵时，才用这个变量收窄。
 ADMIN_JOBS = [j.strip() for j in
-              os.environ.get("ADMIN_JENKINS_JOBS", "Sit-Admin").split(",") if j.strip()]
+              os.environ.get("ADMIN_JENKINS_JOBS", "").split(",") if j.strip()]
 
 
 ADMIN_COMP = "Admin"       # 内部组件名，页面上单独成一块
@@ -79,7 +81,8 @@ ADMIN_VIEW = "后台（另一套 Jenkins）"
 
 
 def admin_ready():
-    return bool(ADMIN_URL and ADMIN_USER and ADMIN_TOKEN and ADMIN_JOBS)
+    """三项就够。job 名单不算必填 —— 没写就自动发现。"""
+    return bool(ADMIN_URL and ADMIN_USER and ADMIN_TOKEN)
 
 # job 命名规约：AR{编号}-{组件}-{国家}-{站点名}
 # 发布单里写的组件名和 Jenkins 里的组件名对不上，这里做别名映射。
@@ -292,6 +295,33 @@ def fetch_builds(names, user, token_, force=False):
     return out, warns
 
 
+def admin_job_names(force=False):
+    """要核对哪些 job。配了就按配的，没配就去那台 Jenkins 上列全部。
+
+    返回 (job名列表, 告警)。列不出来时返回空列表，由调用方报告 —— 
+    不要在这里瞎猜一个名字，猜错了会显示成「没有这个任务」，看着像后台没发。
+    """
+    if ADMIN_JOBS:
+        return list(ADMIN_JOBS), []
+    b = _bucket("__admin__")
+    hit = b["names"]
+    if not force and hit and time.time() - hit["ts"] < CACHE_TTL:
+        return list(hit["jobs"]), []
+    try:
+        data = jenkins_get("/api/json" + _q("jobs[name]"), ADMIN_USER, ADMIN_TOKEN,
+                           timeout=60, base=ADMIN_URL)
+    except Exception as ex:
+        return [], ["连不上后台 Jenkins（%s）：%s。检查 ADMIN_JENKINS_URL / 账号密码，"
+                    "以及这台服务器能不能访问那个地址。"
+                    % (ADMIN_URL, str(getattr(ex, "reason", ex))[:120])]
+    names = [j.get("name") for j in (data.get("jobs") or []) if j.get("name")]
+    with _cache_lock:
+        b["names"] = {"ts": time.time(), "jobs": names}
+    if not names:
+        return [], ["后台 Jenkins 上一个 job 都没列到（可能是这个账号没有读取权限）"]
+    return names, []
+
+
 def fetch_admin_builds(force=False):
     """拉后台那套 Jenkins 上配置的几个 job 的构建历史。
 
@@ -301,8 +331,9 @@ def fetch_admin_builds(force=False):
     """
     b = _bucket("__admin__")
     now = time.time()
-    out, warns = {}, []
-    for name in ADMIN_JOBS:
+    names, warns = admin_job_names(force=force)
+    out = {}
+    for name in names:
         e = b["builds"].get(name)
         if not force and e and now - e["ts"] < CACHE_TTL:
             out[name] = e
@@ -320,7 +351,7 @@ def fetch_admin_builds(force=False):
         with _cache_lock:
             b["builds"][name] = ent
         out[name] = ent
-    return out, warns
+    return out, warns, names
 
 
 def tz_label():
@@ -829,9 +860,12 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
         if c["name"] != ADMIN_COMP:
             continue
         expect = normalize_ref(c["expect"])
-        amap, awarns = fetch_admin_builds(force=force)
+        amap, awarns, ajobs = fetch_admin_builds(force=force)
         warns.extend(awarns)
-        for jobname in ADMIN_JOBS:
+        if not ajobs:
+            warns.append("发布单里要发后台，但后台 Jenkins 这次没核对成（原因见上）。"
+                         "后台发没发请人工确认。")
+        for jobname in ajobs:
             e = amap.get(jobname)
             base = {"site": "后台", "siteName": jobname, "comp": ADMIN_COMP,
                     "compKey": c["key"], "group": c["group"], "onlySite": "",

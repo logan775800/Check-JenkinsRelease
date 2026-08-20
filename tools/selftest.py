@@ -306,7 +306,7 @@ check("没配时给出「不在这套 Jenkins」提示", any("不在这套" in x
 
 # --- 配上第二套 ---
 app.ADMIN_URL, app.ADMIN_USER, app.ADMIN_TOKEN = "https://admin-fake", "u", "t"
-app.ADMIN_JOBS = ["Sit-Admin", "sit-admin-非saas彩票"]
+app.ADMIN_JOBS = []          # 不配 job 名单：应当自动去那台上列
 ADMIN_JOBDATA = {
     "Sit-Admin": [mkbuild(7, NOW, tag="master_V3.09_308", param="BRANCH")],
     "sit-admin-非saas彩票": [mkbuild(3, NOW, tag="master_V3.08_001", param="BRANCH")],
@@ -318,6 +318,8 @@ _plain_get = app.jenkins_get
 def get_with_admin(path, user, token_, timeout=180, base=None):
     if base == "https://admin-fake":
         admin_calls.append((path, user, token_))
+        if is_names(path) or "jobs[name]" in path:
+            return {"jobs": [{"name": n} for n in ADMIN_JOBDATA]}
         name = urllib.parse.unquote(path.split("/job/")[1].split("/api/json")[0])
         if name not in ADMIN_JOBDATA:
             raise RuntimeError("no such job " + name)
@@ -333,7 +335,7 @@ check("配好后不再提示「不在这套」", not any("不在这套" in x for
 
 r11 = run(ADMIN_MANIFEST)
 arows = [x for x in r11["rows"] if x["comp"] == app.ADMIN_COMP]
-check("两个后台 job 各出一行", len(arows) == 2, arows)
+check("没配 job 名单也能自动发现两个 job", len(arows) == 2, arows)
 check("BRANCH 参数能读出版本",
       any(x["actual"] == "master_V3.09_308" for x in arows), arows)
 check("版本对的判 OK",
@@ -363,9 +365,31 @@ r11b = run(ADMIN_MANIFEST)
 arows_b = [x for x in r11b["rows"] if x["comp"] == app.ADMIN_COMP]
 check("一个后台 job 挂了，另一个照常出结果", len(arows_b) >= 1, arows_b)
 check("拉失败要告警，不能静默", any("后台 Jenkins" in x for x in r11b["warnings"]), r11b["warnings"])
+# --- 整台后台 Jenkins 连不上：必须明说「没核对成，请人工确认」---
+reset()
+app._cache.clear()
+
+
+def get_admin_dead(path, user, token_, timeout=180, base=None):
+    if base == "https://admin-fake":
+        raise RuntimeError("Name or service not known")
+    return _plain_get(path, user, token_, timeout)
+
+
+app.jenkins_get = get_admin_dead
+r11c = run(ADMIN_MANIFEST)
+check("连不上时不产生任何后台行（别假装核对过）",
+      not [x for x in r11c["rows"] if x["comp"] == app.ADMIN_COMP], r11c["rows"])
+check("连不上时点明要人工确认",
+      any("人工确认" in x for x in r11c["warnings"]), r11c["warnings"])
+check("连不上时给出可照做的排查方向",
+      any("ADMIN_JENKINS_URL" in x for x in r11c["warnings"]), r11c["warnings"])
+check("后台连不上不影响 AR 站点核对",
+      any(x["comp"] == "Pages" for x in r11c["rows"]), r11c["rows"])
+
 app.jenkins_get = _plain_get
 app.ADMIN_URL = app.ADMIN_USER = app.ADMIN_TOKEN = ""
-app.ADMIN_JOBS = ["Sit-Admin"]
+app.ADMIN_JOBS = []
 
 print("\n== 12. 并发去重 ==")
 reset()

@@ -161,7 +161,8 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 | `JENKINS_CACHE_TTL` | 60 | 缓存秒数 |
 | `JENKINS_FETCH_CONCURRENCY` | 6 | 按需拉构建历史的并发数。往上调容易被 Jenkins 前面的 WAF 限速 |
 | `JENKINS_BULK_THRESHOLD` | 200 | 要拉的 job 超过这个数就改用「一次性全量」那条老路 |
-| `ADMIN_JENKINS_URL` / `_USER` / `_TOKEN` / `_JOBS` | 空 | 后台(Admin)那套独立 Jenkins。四项配齐才启用，见下 |
+| `ADMIN_JENKINS_URL` / `_USER` / `_TOKEN` | 空 | 后台(Admin)那套独立 Jenkins。三项配齐才启用，见下 |
+| `ADMIN_JENKINS_JOBS` | 空=自动发现 | 只在后台 Jenkins 上无关 job 太多时用来收窄 |
 
 ### 后台（Admin）走第二套 Jenkins
 
@@ -173,9 +174,16 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 
 ```bash
 ADMIN_JENKINS_URL=https://后台jenkins地址
-ADMIN_JENKINS_USER=登录名
-ADMIN_JENKINS_TOKEN=在那台的 /me/security/ 生成
-ADMIN_JENKINS_JOBS=Sit-Admin,sit-admin-非saas彩票   # 逗号分隔
+ADMIN_JENKINS_USER=登录名          # 那台 Jenkins 的登录名，不是邮箱
+ADMIN_JENKINS_TOKEN=在那台的 <地址>/me/security/ 生成
+```
+
+**只要这三项。** `ADMIN_JENKINS_JOBS` 是可选的收窄开关，留空就自动去那台
+Jenkins 上列出全部 job 逐个核对 —— 别逼使用者先知道 job 叫什么才能用，
+那恰恰是他最不知道的一项。只有那台上混着一堆无关 job、结果太吵时才需要写：
+
+```bash
+ADMIN_JENKINS_JOBS=Sit-Admin,sit-admin-非saas彩票   # 逗号分隔，可选
 ```
 
 几个刻意的取舍：
