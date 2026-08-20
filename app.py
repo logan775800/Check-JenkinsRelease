@@ -1409,7 +1409,56 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"error": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False), "application/json")
 
 
+def probe_admin():
+    """`python app.py --probe-admin` —— 后台 Jenkins 连不上时的自检。
+
+    必须在**容器里**跑：宿主机是 CentOS 7.9（OpenSSL 1.0.2k，最高 TLS 1.2），
+    而 WAF 只收 TLS 1.3，宿主机上 curl 连握手都成功不了，`-s` 还会把错误吞掉，
+    表现成「什么都没输出」，看着像没反应，其实是根本没连上。
+        docker compose exec jenkins-check python /app/app.py --probe-admin
+    """
+    print("=== 后台 Jenkins 自检 ===")
+    print("ADMIN_JENKINS_URL   = %s" % (ADMIN_URL or "(空)"))
+    print("ADMIN_JENKINS_USER  = %s" % (ADMIN_USER or "(空)"))
+    print("ADMIN_JENKINS_TOKEN = %s" % ("已设置，%d 位" % len(ADMIN_TOKEN) if ADMIN_TOKEN else "(空)"))
+    print("构建 job / 部署视图  = %s / %s" % (ADMIN_BUILD_JOB, ADMIN_DEPLOY_VIEW))
+    if not admin_ready():
+        print("\n结论：三项没配齐，容器里读不到 —— 后台不会被核对。")
+        print("      改的是 /data/Check-JenkinsRelease/.env 吗？改完必须 "
+              "`docker compose up -d --build`，只 restart 不会重新读镜像里的代码。")
+        return 1
+    import urllib.error
+    for label, path in (("列 %s 视图" % ADMIN_DEPLOY_VIEW,
+                         "/view/" + urllib.parse.quote(ADMIN_DEPLOY_VIEW, safe="") + "/api/json"
+                         + _q("jobs[name]")),
+                        ("读 %s" % ADMIN_BUILD_JOB,
+                         "/job/" + urllib.parse.quote(ADMIN_BUILD_JOB, safe="") + "/api/json"
+                         + _q("builds[number]{0,1}"))):
+        print("\n--- %s ---" % label)
+        try:
+            data = jenkins_get(path, ADMIN_USER, ADMIN_TOKEN, timeout=60, base=ADMIN_URL)
+        except urllib.error.HTTPError as e:
+            print("HTTP %d" % e.code)
+            for k, v in dict(e.headers).items():
+                if k.lower() in ("server", "cf-ray", "x-jenkins", "www-authenticate"):
+                    print("   %s: %s" % (k, v))
+            print("→ " + friendly_http(e, label))
+            continue
+        except Exception as e:
+            print("连不上：%s" % (str(getattr(e, "reason", e))[:200]))
+            print("→ " + friendly_neterr(e))
+            continue
+        jobs = [j.get("name") for j in (data.get("jobs") or [])]
+        if jobs:
+            print("OK，%d 个 job：%s" % (len(jobs), "、".join(jobs[:20])))
+        else:
+            print("OK，返回：%s" % json.dumps(data, ensure_ascii=False)[:200])
+    return 0
+
+
 def main():
+    if "--probe-admin" in sys.argv:
+        sys.exit(probe_admin())
     if not JENKINS_URL:
         print("缺 JENKINS_URL。设置环境变量后重试，例如：")
         print("  export JENKINS_URL='https://jenkins.example.com'")

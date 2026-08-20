@@ -189,6 +189,27 @@ ADMIN_JENKINS_TOKEN=在 https://admin-jenkins.ihhfzad.com/me/security/ 生成
 额外会抓一种最容易漏的情况：**`build_admin` 构建成功了，但一个部署都没执行**
 （制品打好了忘了去点 Build Now），这会单独告警。
 
+**连不上时怎么查**（必须在容器里跑，见下）：
+
+```bash
+docker compose exec jenkins-check python /app/app.py --probe-admin
+```
+
+它会打印容器里实际读到的配置、逐个请求、并把响应头里的 `X-Jenkins` / `CF-RAY` 摆出来。
+
+**别在宿主机上用 curl 试。** CentOS 7.9 的 OpenSSL 1.0.2k 最高 TLS 1.2，而 WAF 只收
+TLS 1.3，宿主机连握手都成功不了；再加上 `curl -s` 会把错误信息一起吞掉，
+结果是**什么都不输出**，看着像没反应，其实根本没连上。容器里才有 OpenSSL 3.x。
+
+按返回码对号入座：
+
+| 返回 | 含义 | 去做什么 |
+|---|---|---|
+| **403** + `X-Jenkins` | 身份认了，但**没有读取权限**（或压根没带凭据被当成匿名） | 让管理员给这个账号 Overall/Read |
+| **401** | 用户名或 Token 不对 | 用户名填登录名不是邮箱；Token 必须在**这台**生成 |
+| **403** 只有 `CF-RAY` | WAF 拦的，请求没到 Jenkins | 把服务器出口 IP 加进 WAF 白名单 |
+| 连不上/超时 | 网络不通 | 查容器到那个地址的连通性 |
+
 几个刻意的取舍：
 
 - **不配就退回原样**，不会报错、不影响其余核对。
