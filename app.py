@@ -1428,6 +1428,7 @@ def probe_admin():
               "`docker compose up -d --build`，只 restart 不会重新读镜像里的代码。")
         return 1
     import urllib.error
+    waf = False
     for label, path in (("列 %s 视图" % ADMIN_DEPLOY_VIEW,
                          "/view/" + urllib.parse.quote(ADMIN_DEPLOY_VIEW, safe="") + "/api/json"
                          + _q("jobs[name]")),
@@ -1442,6 +1443,9 @@ def probe_admin():
             for k, v in dict(e.headers).items():
                 if k.lower() in ("server", "cf-ray", "x-jenkins", "www-authenticate"):
                     print("   %s: %s" % (k, v))
+            hl = {k.lower() for k in dict(e.headers)}
+            if e.code == 403 and "x-jenkins" not in hl and "cf-ray" in hl:
+                waf = True
             print("→ " + friendly_http(e, label))
             continue
         except Exception as e:
@@ -1453,6 +1457,20 @@ def probe_admin():
             print("OK，%d 个 job：%s" % (len(jobs), "、".join(jobs[:20])))
         else:
             print("OK，返回：%s" % json.dumps(data, ensure_ascii=False)[:200])
+        waf = False
+    if waf:
+        # 判成 WAF 拦截时，下一个问题必然是「那加哪个 IP」。别让人再去搜一遍：
+        # 容器出网走宿主机 NAT，所以这里查到的就是 Cloudflare 看到的那个源 IP。
+        print("\n--- 该把哪个 IP 加进白名单 ---")
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+                print("这台服务器的出口 IP：%s" % r.read().decode().strip())
+        except Exception as e:
+            print("查出口 IP 失败（%s）。在宿主机上跑 `curl -4 ifconfig.me` 也行。"
+                  % str(getattr(e, "reason", e))[:80])
+        print("把它加进 Cloudflare 里 %s 那条规则的白名单。"
+              % (ADMIN_URL.split("//")[-1] or "admin-jenkins"))
+        print("注意：AR 那套 (jenkins.ihhfzad.com) 放行了不代表这套也放行 —— 规则是按域名分别配的。")
     return 0
 
 
