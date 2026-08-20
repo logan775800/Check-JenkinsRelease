@@ -307,9 +307,11 @@ check("没配时给出「不在这套 Jenkins」提示", any("不在这套" in x
 # --- 配上第二套 ---
 app.ADMIN_URL, app.ADMIN_USER, app.ADMIN_TOKEN = "https://admin-fake", "u", "t"
 app.ADMIN_JOBS = []          # 不配 job 名单：应当自动去那台上列
+# 真实流程：版本号输在 build_admin 上，admin_ALL 视图里的 job 只是点 Build Now 部署。
 ADMIN_JOBDATA = {
-    "Sit-Admin": [mkbuild(7, NOW, tag="master_V3.09_308", param="BRANCH")],
-    "sit-admin-非saas彩票": [mkbuild(3, NOW, tag="master_V3.08_001", param="BRANCH")],
+    "build_admin": [mkbuild(1452, NOW, tag="master_V3.09_308", param="VERSION")],
+    "saasdemo-admin-印度": [mkbuild(149, NOW, param=None, rev=False)],   # 部署 job：无版本参数
+    "saasdemo-admin-越南": [mkbuild(134, NOW, param=None, rev=False)],
 }
 admin_calls = []
 _plain_get = app.jenkins_get
@@ -318,6 +320,8 @@ _plain_get = app.jenkins_get
 def get_with_admin(path, user, token_, timeout=180, base=None):
     if base == "https://admin-fake":
         admin_calls.append((path, user, token_))
+        if "/view/" in path:      # 部署视图：只含部署 job，不含 build_admin
+            return {"jobs": [{"name": n} for n in ADMIN_JOBDATA if n != "build_admin"]}
         if is_names(path) or "jobs[name]" in path:
             return {"jobs": [{"name": n} for n in ADMIN_JOBDATA]}
         name = urllib.parse.unquote(path.split("/job/")[1].split("/api/json")[0])
@@ -335,15 +339,40 @@ check("配好后不再提示「不在这套」", not any("不在这套" in x for
 
 r11 = run(ADMIN_MANIFEST)
 arows = [x for x in r11["rows"] if x["comp"] == app.ADMIN_COMP]
-check("没配 job 名单也能自动发现两个 job", len(arows) == 2, arows)
-check("BRANCH 参数能读出版本",
-      any(x["actual"] == "master_V3.09_308" for x in arows), arows)
-check("版本对的判 OK",
-      [x["state"] for x in arows if x["siteName"] == "Sit-Admin"] == ["OK"], arows)
-check("版本不对的判 VER",
-      [x["state"] for x in arows if x["siteName"] == "sit-admin-非saas彩票"] == ["VER"], arows)
-check("后台行不伪造成按站点发（site 恒为「后台」）",
-      {x["site"] for x in arows} == {"后台"}, arows)
+check("构建 + 两个部署 job 共三行", len(arows) == 3, [(x["site"], x["siteName"]) for x in arows])
+bld = [x for x in arows if x["siteName"] == "build_admin"]
+dep = [x for x in arows if x["site"] == "后台部署"]
+check("build_admin 归到「后台构建」", bld and bld[0]["site"] == "后台构建", arows)
+check("构建那行读得出版本号", bld and bld[0]["actual"] == "master_V3.09_308", bld)
+check("版本对 → 构建判 OK", bld and bld[0]["state"] == "OK", bld)
+check("两个部署 job 都出行", len(dep) == 2, dep)
+check("部署 job 跑过就判 OK（不比版本）",
+      all(x["state"] == "OK" for x in dep), dep)
+check("部署 job 不显示版本（它本来就没有）",
+      all(not x["actual"] for x in dep), dep)
+check("部署 job 说明写「已执行」", all("已执行" in x["detail"] for x in dep), dep)
+
+# 版本打错：只该构建那行变红，部署行不受影响
+reset()
+ADMIN_JOBDATA["build_admin"] = [mkbuild(1453, NOW, tag="master_V3.07_001", param="VERSION")]
+r_ver = run(ADMIN_MANIFEST)
+av = [x for x in r_ver["rows"] if x["comp"] == app.ADMIN_COMP]
+check("版本不对 → 构建判 VER",
+      [x["state"] for x in av if x["site"] == "后台构建"] == ["VER"], av)
+check("构建版本错不影响部署行判定",
+      all(x["state"] == "OK" for x in av if x["site"] == "后台部署"), av)
+ADMIN_JOBDATA["build_admin"] = [mkbuild(1452, NOW, tag="master_V3.09_308", param="VERSION")]
+
+# 构建了但一个都没部署 —— 最容易漏的一步
+reset()
+_keep = {k: v for k, v in ADMIN_JOBDATA.items()}
+ADMIN_JOBDATA["saasdemo-admin-印度"] = [mkbuild(149, NOW - 30 * DAY, param=None, rev=False)]
+ADMIN_JOBDATA["saasdemo-admin-越南"] = [mkbuild(134, NOW - 30 * DAY, param=None, rev=False)]
+r_nodep = run(ADMIN_MANIFEST)
+check("构建成功但没部署要单独告警",
+      any("一个部署都没执行" in x for x in r_nodep["warnings"]), r_nodep["warnings"])
+ADMIN_JOBDATA.clear(); ADMIN_JOBDATA.update(_keep)
+reset()
 check("用的是后台自己的凭据，不是 AR 那套",
       admin_calls and all(u == "u" and t == "t" for _p, u, t in admin_calls), admin_calls)
 check("AR 站点照常核对，没被后台挤掉",
@@ -355,7 +384,7 @@ del admin_calls[:]
 
 
 def get_admin_flaky(path, user, token_, timeout=180, base=None):
-    if base == "https://admin-fake" and "Sit-Admin/api" in path.replace("%2D", "-"):
+    if base == "https://admin-fake" and "%E5%8D%B0%E5%BA%A6" in path:   # 印度那个部署 job
         raise RuntimeError("connection refused")
     return get_with_admin(path, user, token_, timeout, base)
 
@@ -363,7 +392,8 @@ def get_admin_flaky(path, user, token_, timeout=180, base=None):
 app.jenkins_get = get_admin_flaky
 r11b = run(ADMIN_MANIFEST)
 arows_b = [x for x in r11b["rows"] if x["comp"] == app.ADMIN_COMP]
-check("一个后台 job 挂了，另一个照常出结果", len(arows_b) >= 1, arows_b)
+check("一个部署 job 挂了，其余照常出结果", len(arows_b) >= 2, arows_b)
+check("挂掉的那个不造假行", all(x["siteName"] != "saasdemo-admin-印度" for x in arows_b), arows_b)
 check("拉失败要告警，不能静默", any("后台 Jenkins" in x for x in r11b["warnings"]), r11b["warnings"])
 # --- 整台后台 Jenkins 连不上：必须明说「没核对成，请人工确认」---
 reset()

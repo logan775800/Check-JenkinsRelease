@@ -69,9 +69,16 @@ MAX_BODY = 2 * 1024 * 1024  # /api/check 请求体上限。发布单再长也就
 ADMIN_URL = os.environ.get("ADMIN_JENKINS_URL", "").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_JENKINS_USER", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_JENKINS_TOKEN", "")
-# 要核对哪几个 job，逗号分隔。**留空就自动去那台 Jenkins 上列全部 job** ——
-# 别逼使用者先知道 job 叫什么才能用，那正是他配不出来的那一项。
-# 只有当那台上混着一堆无关 job、核对结果太吵时，才用这个变量收窄。
+# 后台的发版是**两步**，跟 AR 那套完全不同（他描述的实际操作）：
+#   1. 先跑 build_admin，**版本号输在这里**，产出制品；
+#   2. 再去 admin_ALL 视图里逐个点 Build Now，把制品部署到各站点。
+# 所以「后台核对」要拆成两个问题，混成一个必然出错：
+#   • 构建：build_admin 这一版打的是不是发布单要求的版本？（比版本）
+#   • 部署：admin_ALL 里哪些 job 在时间窗内真的跑了？（比跑没跑，**没有版本可比**）
+# 拿部署 job 去比版本，会因为它们根本没有版本参数而全判「版本未知」，纯噪音。
+ADMIN_BUILD_JOB = os.environ.get("ADMIN_JENKINS_BUILD_JOB", "build_admin").strip()
+ADMIN_DEPLOY_VIEW = os.environ.get("ADMIN_JENKINS_DEPLOY_VIEW", "admin_ALL").strip()
+# 手动指定部署 job（逗号分隔）。留空就从上面那个视图里列。
 ADMIN_JOBS = [j.strip() for j in
               os.environ.get("ADMIN_JENKINS_JOBS", "").split(",") if j.strip()]
 
@@ -295,11 +302,11 @@ def fetch_builds(names, user, token_, force=False):
     return out, warns
 
 
-def admin_job_names(force=False):
-    """要核对哪些 job。配了就按配的，没配就去那台 Jenkins 上列全部。
+def admin_deploy_jobs(force=False):
+    """部署 job 名单：配了就按配的，没配就从 ADMIN_DEPLOY_VIEW 那个视图里列。
 
-    返回 (job名列表, 告警)。列不出来时返回空列表，由调用方报告 —— 
-    不要在这里瞎猜一个名字，猜错了会显示成「没有这个任务」，看着像后台没发。
+    返回 (job名列表, 告警)。列不出来就返回空 —— 绝不瞎猜一个名字，
+    猜错了会显示成「没有这个任务」，看着像后台没发。
     """
     if ADMIN_JOBS:
         return list(ADMIN_JOBS), []
@@ -307,18 +314,22 @@ def admin_job_names(force=False):
     hit = b["names"]
     if not force and hit and time.time() - hit["ts"] < CACHE_TTL:
         return list(hit["jobs"]), []
+    path = "/view/" + urllib.parse.quote(ADMIN_DEPLOY_VIEW, safe="") + "/api/json"
     try:
-        data = jenkins_get("/api/json" + _q("jobs[name]"), ADMIN_USER, ADMIN_TOKEN,
+        data = jenkins_get(path + _q("jobs[name]"), ADMIN_USER, ADMIN_TOKEN,
                            timeout=60, base=ADMIN_URL)
     except Exception as ex:
-        return [], ["连不上后台 Jenkins（%s）：%s。检查 ADMIN_JENKINS_URL / 账号密码，"
+        return [], ["连不上后台 Jenkins 的「%s」视图（%s）：%s。"
+                    "检查 ADMIN_JENKINS_URL / 账号 Token / 视图名，"
                     "以及这台服务器能不能访问那个地址。"
-                    % (ADMIN_URL, str(getattr(ex, "reason", ex))[:120])]
+                    % (ADMIN_DEPLOY_VIEW, ADMIN_URL,
+                       str(getattr(ex, "reason", ex))[:120])]
     names = [j.get("name") for j in (data.get("jobs") or []) if j.get("name")]
     with _cache_lock:
         b["names"] = {"ts": time.time(), "jobs": names}
     if not names:
-        return [], ["后台 Jenkins 上一个 job 都没列到（可能是这个账号没有读取权限）"]
+        return [], ["后台 Jenkins 的「%s」视图里一个 job 都没有（视图名写错？或该账号无权限）"
+                    % ADMIN_DEPLOY_VIEW]
     return names, []
 
 
@@ -331,7 +342,9 @@ def fetch_admin_builds(force=False):
     """
     b = _bucket("__admin__")
     now = time.time()
-    names, warns = admin_job_names(force=force)
+    names, warns = admin_deploy_jobs(force=force)
+    if ADMIN_BUILD_JOB:
+        names = [ADMIN_BUILD_JOB] + [n for n in names if n != ADMIN_BUILD_JOB]
     out = {}
     for name in names:
         e = b["builds"].get(name)
@@ -862,15 +875,26 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
         expect = normalize_ref(c["expect"])
         amap, awarns, ajobs = fetch_admin_builds(force=force)
         warns.extend(awarns)
-        if not ajobs:
-            warns.append("发布单里要发后台，但后台 Jenkins 这次没核对成（原因见上）。"
-                         "后台发没发请人工确认。")
+        if not amap:
+            # 一条都没拉到 = 根本没连上那台。这时**不能出任何后台行**：
+            # 出一行「没取到这个任务」看着像后台缺了这个 job，而事实是我们没连上，
+            # 那是把「不知道」显示成了「查过了」。
+            warns.append("发布单里要发后台，但这次一条后台数据都没拉到（原因见上），"
+                         "**后台等于没核对**。后台发没发请人工确认。")
+            continue
         for jobname in ajobs:
+            if jobname not in amap:
+                continue          # 这个 job 没拉到，上面已单独告警，别造行
+
+            # 构建那一步才带版本号；部署 job 只是点 Build Now，没有版本可比。
+            # 拿部署 job 去比版本会全判「版本未知」，那是纯噪音。
+            is_build = (jobname == ADMIN_BUILD_JOB)
             e = amap.get(jobname)
-            base = {"site": "后台", "siteName": jobname, "comp": ADMIN_COMP,
+            base = {"site": "后台构建" if is_build else "后台部署",
+                    "siteName": jobname, "comp": ADMIN_COMP,
                     "compKey": c["key"], "group": c["group"], "onlySite": "",
                     "view": ADMIN_VIEW, "job": jobname, "jobSuffix": "",
-                    "expect": c["expect"], "url": (e or {}).get("url", "")}
+                    "expect": c["expect"] if is_build else "", "url": (e or {}).get("url", "")}
             if e is None:
                 rows.append(dict(base, state="NOJOB", detail="后台 Jenkins 没取到这个任务"))
                 continue
@@ -882,23 +906,37 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                     truncated.add(jobname)
                 rows.append(dict(base, state="MISS",
                                  detail=("最近 %d 次构建都晚于时间窗，可能没查全（不一定真的没发）"
-                                         % MAX_BUILDS_PER_JOB) if cut else "时间窗内没有构建"))
+                                         % MAX_BUILDS_PER_JOB) if cut
+                                 else ("时间窗内没构建过" if is_build else "时间窗内没执行过部署")))
                 continue
             b = inwin[0]
             actual = b["want"] or b["got"]
             if b["result"] == "BUILDING":
-                st, detail = "RUN", f"#{b['num']} 正在构建中"
+                st, detail = "RUN", f"#{b['num']} 正在{'构建' if is_build else '部署'}中"
             elif b["result"] != "SUCCESS":
                 st, detail = "FAIL", f"#{b['num']} {b['result']}  {b['time']}  by {b['who']}"
+            elif not is_build:
+                # 部署 job：跑过且成功就是达成。这里不谈版本 ——
+                # 它部署的是 build_admin 产出的那份制品，版本对不对由构建那行负责。
+                st = "OK"
+                detail = f"#{b['num']} 已执行 {b['time']}  by {b['who']}"
             elif expect and not actual:
-                st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录分支/tag，版本无法核对"
+                st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录版本参数，无法核对"
             elif expect and actual and normalize_ref(actual) != expect:
                 st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
             else:
                 st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
             rows.append(dict(base, state=st, detail=detail, num=b["num"], result=b["result"],
                              time=b["time"], ts=b["ts"], sha=b["sha"], who=b["who"],
-                             actual=actual, dur=b["dur"], url=b["url"] or base["url"]))
+                             actual=actual if is_build else "", dur=b["dur"],
+                             url=b["url"] or base["url"]))
+        # 构建成功但一个部署都没跑 —— 最容易漏的一步：制品打好了，忘了去点部署。
+        arows = [x for x in rows if x["comp"] == ADMIN_COMP]
+        built_ok = any(x["site"] == "后台构建" and x["state"] == "OK" for x in arows)
+        deployed = [x for x in arows if x["site"] == "后台部署" and x["state"] == "OK"]
+        if built_ok and ajobs and not deployed:
+            warns.append("后台 build_admin 这一版构建成功了，但「%s」视图里**一个部署都没执行**。"
+                         "制品打好了没发出去 —— 去点 Build Now。" % ADMIN_DEPLOY_VIEW)
 
     summary = {}
     for r in rows:

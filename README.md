@@ -166,35 +166,36 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 
 ### 后台（Admin）走第二套 Jenkins
 
-后台不在 AR 那套 Jenkins 上，是独立的一台（Windows，job 叫 `Sit-Admin` 之类），
-**命名规约、版本参数名、凭据全都不一样**。以前发布单里的「admin → xxx」直接跳过不核对，
-每次发版后台发没发、发的哪版，得另外找人问。
+后台在 **`admin-jenkins.ihhfzad.com`**，和 AR 那套是两个独立实例（Token 不通用，
+已实测：拿 AR 的 Token 查它直接 401）。以前发布单里的「admin → xxx」直接跳过不核对。
 
-在 `.env` 里配齐四项就会一起核对：
-
-```bash
-ADMIN_JENKINS_URL=https://后台jenkins地址
-ADMIN_JENKINS_USER=登录名          # 那台 Jenkins 的登录名，不是邮箱
-ADMIN_JENKINS_TOKEN=在那台的 <地址>/me/security/ 生成
-```
-
-**只要这三项。** `ADMIN_JENKINS_JOBS` 是可选的收窄开关，留空就自动去那台
-Jenkins 上列出全部 job 逐个核对 —— 别逼使用者先知道 job 叫什么才能用，
-那恰恰是他最不知道的一项。只有那台上混着一堆无关 job、结果太吵时才需要写：
+在 `.env` 里配三项就会一起核对：
 
 ```bash
-ADMIN_JENKINS_JOBS=Sit-Admin,sit-admin-非saas彩票   # 逗号分隔，可选
+ADMIN_JENKINS_URL=https://admin-jenkins.ihhfzad.com
+ADMIN_JENKINS_USER=登录名          # 那台的登录名，不是邮箱
+ADMIN_JENKINS_TOKEN=在 https://admin-jenkins.ihhfzad.com/me/security/ 生成
 ```
+
+**后台发版是两步，所以核对也必须拆成两步** —— 这是它和 AR 那套最大的不同：
+
+| 步骤 | job | 核对什么 |
+|---|---|---|
+| 1. 构建 | `build_admin`（`ADMIN_JENKINS_BUILD_JOB`） | **比版本**：这一版打的是不是发布单要求的版本号 |
+| 2. 部署 | `admin_ALL` 视图里的 job（`ADMIN_JENKINS_DEPLOY_VIEW`） | **只看跑没跑**：它们是点 Build Now 部署制品，本身没有版本参数 |
+
+拿部署 job 去比版本，会因为它们根本没有版本参数而全判「版本未知」，纯噪音 —— 别这么改。
+
+额外会抓一种最容易漏的情况：**`build_admin` 构建成功了，但一个部署都没执行**
+（制品打好了忘了去点 Build Now），这会单独告警。
 
 几个刻意的取舍：
 
-- **不配就退回原样**（还是提示「不在这套 Jenkins」），不会报错、不影响其余核对。
-- **凭据独立**：那台机器和 AR 这套没关系，不共用 Token。
-- **不伪造成按站点发**：后台是整个平台一套，页面上一个 job 一行、站点栏固定写「后台」。
-  硬塞进站点网格会让人以为它按站点发，那是编出来的信息。
-- **某个 job 拉不到只影响它自己**，其余照常出结果并单独告警 —— 后台常有 saas/非saas
-  多个变体，挂一个不该让整块后台核对都没了。
-- 版本参数名多试一个 **`BRANCH`**（`Sit-Admin` 用的是它，不是 `TAG`/`BRANCH_NAME`）。
+- **不配就退回原样**，不会报错、不影响其余核对。
+- **凭据独立**：那台和 AR 这套没关系，不共用 Token。
+- **一条都没拉到时不产生任何后台行**，只报「后台等于没核对，请人工确认」。
+  造一行「没取到这个任务」看着像后台缺 job，而事实是没连上 —— 那是把「不知道」
+  显示成「查过了」。单个 job 拉不到也同理：只告警，不造行。
 
 ### 取数策略（为什么快了）
 
