@@ -1045,12 +1045,8 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                 e, expect, False, admin_builds))
 
         arows = [x for x in rows if x["comp"] == ADMIN_COMP]
-        # 后台上有、但这次发布单没列的站点：不核对，但要说一声 ——
-        # 「这次没发」和「漏发了」是两回事，只有他自己知道是哪种。
-        extra = sorted(set(by_site) - set(sites))
-        if extra:
-            warns.append("后台还有 %d 个站点这次没在发布单里，未核对：%s%s"
-                         % (len(extra), "、".join(extra[:12]), "…" if len(extra) > 12 else ""))
+        # 刻意不再提「后台上还有哪些站点没在发布单里」：他的流程是发布单驱动的，
+        # 清单外的站点本来就不该这次发，那条提示只是噪音，还占着最显眼的位置。
         # 构建成功但一个站点都没部署 —— 最容易漏的一步：制品打好了，忘了去点。
         built_ok = any(x["site"] == "后台构建" and x["state"] == "OK" for x in arows)
         if built_ok and not any(x["state"] == "OK" and x["site"] != "后台构建" for x in arows):
@@ -1275,6 +1271,10 @@ $('prob').onchange=()=>{if(window.__d)render(window.__d);};
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // 和后端同一套归一化：Git 插件把分支记成 refs/remotes/origin/xxx，比对前要剥前缀
 const norm=s=>String(s||'').replace(/^refs\/remotes\//,'').replace(/^refs\/heads\//,'').replace(/^origin\//,'');
+// 后端给的是时间戳数值。别用 time 字符串去算——Math.max("07-14 16:49") 是 NaN，
+// 会把最旧的标成最新（踩过）。
+const fmtTs=t=>{const d=new Date(t*1000);const p=n=>String(n).padStart(2,'0');
+  return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());};
 
 function render(d){
   window.__d=d;
@@ -1297,9 +1297,14 @@ function render(d){
   d.components.forEach(c=>{
     const rs=d.rows.filter(r=>r.compKey===c.key&&r.sha&&r.state==='OK');
     if(rs.length<2)return;
+    // 「落后」的判定依据：同一组件、同一分支名，却出现了不止一个 SHA。
+    // 以**最后一次构建**拿到的那个 SHA 为基准，凡是构建出别的 SHA 的行都是落后的
+    // ——分支是可变指针，它们构建那一刻分支顶端还没有后来那些提交。
     const newest=rs.reduce((a,b)=>(b.ts||0)>(a.ts||0)?b:a).sha;
+    const nFirst=Math.min.apply(null,rs.filter(r=>r.sha===newest).map(r=>r.ts||0));
     rs.forEach(r=>{if(r.sha!==newest)stale.push(Object.assign({},r,{state:'STALE',
-      detail:'分支名对，但代码是旧的：SHA '+r.sha+'（最新是 '+newest+'）'}));});
+      detail:'本次构建拿到 '+r.sha+'；'+fmtTs(nFirst)+' 之后发的站点拿到的是 '
+             +newest+'。同一个分支名，中间有人推了新提交，这台上的是旧代码。'}));});
   });
   d.summary.STALE=stale.length||undefined;
   // 色块也要跟着变色。否则「需要处理」里写着 AR012 代码落后，滚到网格里它却是绿的，
@@ -1310,12 +1315,17 @@ function render(d){
     h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+bad.length+' 项</span>'+
        '<span class="h2r"><button class="sec" id="copybad">复制清单</button></span></h2>'+
        '<div id="poll"></div><div class="tbwrap"><table>'+
-       '<tr><th>状态</th><th>站点</th><th>任务</th><th>说明</th></tr>';
-    bad.sort((a,b)=>BAD.indexOf(a.state)-BAD.indexOf(b.state));
+       // 分支和构建时间必须直接摆在这张表里：判断「这条要不要现在处理」靠的就是
+       // 它发的哪个分支、什么时候发的。塞在说明里要读一句话才能拼出来。
+       '<tr><th>状态</th><th>站点</th><th>任务</th><th>分支/tag</th><th>SHA</th>'+
+       '<th>构建时间</th><th>说明</th></tr>';
+    bad.sort((a,b)=>BAD.indexOf(a.state)-BAD.indexOf(b.state)||(b.ts||0)-(a.ts||0));
     bad.forEach(r=>{h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
       (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
       (r.url?'<a href="'+esc(r.url)+'" target="_blank">'+esc(r.job||'-')+'</a>':esc(r.job||'-'))+
-      '</td><td>'+esc(r.detail)+'</td></tr>';});
+      '</td><td>'+esc(r.actual||r.expect||'—')+'</td><td><code>'+esc(r.sha||'—')+'</code></td>'+
+      '<td>'+esc(r.time||'—')+(r.num?' <small>#'+r.num+'</small>':'')+'</td>'+
+      '<td>'+esc(r.detail)+'</td></tr>';});
     h+='</table></div></div>';
   }
 
@@ -1337,8 +1347,7 @@ function render(d){
       const firstTs=k=>Math.min.apply(null,shas[k].map(r=>r.ts||0));
       keys.sort((a,b)=>lastTs(b)-lastTs(a));          // 最新的排最前
       const newest=keys[0];
-      const fmt=t=>{const d=new Date(t*1000);const p=n=>String(n).padStart(2,'0');
-                    return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());};
+      const fmt=fmtTs;
       h+='<div class="warn" style="margin:8px 0 0">⚠ 分支名一样但代码不一样：本组件出现 '+keys.length+
          ' 个不同 SHA，说明期间分支上有新提交，先发的站点代码是旧的。'+
          keys.map(k=>{
@@ -1391,7 +1400,11 @@ function render(d){
     const txt=['发版核对 '+d.date+(d.days>1?' 起 '+d.days+' 天':'')+' · '+
                BAD.filter(k=>d.summary[k]).map(k=>LABEL[k]+' '+d.summary[k]).join(' / ')]
       .concat(bad.map(r=>'['+LABEL[r.state]+'] '+r.site+(r.siteName?'('+r.siteName+')':'')+
-                          ' '+(r.job||'-')+'  '+(r.detail||''))).join('\n');
+                          ' '+(r.job||'-')+
+                          '  分支 '+(r.actual||r.expect||'—')+
+                          (r.sha?'  SHA '+r.sha:'')+
+                          (r.time?'  构建 '+r.time:'')+
+                          '  '+(r.detail||''))).join('\n');
     const done=()=>{cb.textContent='已复制';setTimeout(()=>cb.textContent='复制清单',1500);};
     if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt).then(done,()=>fallback(txt,done));}
     else fallback(txt,done);
