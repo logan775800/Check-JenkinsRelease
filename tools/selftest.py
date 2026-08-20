@@ -421,7 +421,32 @@ app.jenkins_get = _plain_get
 app.ADMIN_URL = app.ADMIN_USER = app.ADMIN_TOKEN = ""
 app.ADMIN_JOBS = []
 
-print("\n== 12. 并发去重 ==")
+print("\n== 12. 403/401 要分清是谁拒的 ==")
+# 同样一句 Forbidden，三种来源三种修法。不分层就会在错误方向上排查半天。
+import urllib.error as _ue
+
+
+def _http_err(code, headers):
+    return _ue.HTTPError("https://x/api/json", code, "Forbidden", headers, None)
+
+
+_m = app.friendly_http(_http_err(403, {"Server": "cloudflare", "CF-RAY": "abc",
+                                       "X-Jenkins": "2.460"}), "build_admin")
+check("Jenkins 本体 403 → 说没权限/凭据没生效", "X-Jenkins" in _m and "权限" in _m, _m)
+check("Jenkins 403 不提 WAF 白名单（会把人带偏）", "白名单" not in _m, _m)
+
+_m = app.friendly_http(_http_err(403, {"Server": "cloudflare", "CF-RAY": "abc"}), "admin_ALL 视图")
+check("只有 CF-RAY → 判成 WAF 拦截", "WAF" in _m and "白名单" in _m, _m)
+check("WAF 403 要点明请求没到 Jenkins", "没到 Jenkins" in _m, _m)
+
+_m = app.friendly_http(_http_err(401, {"Server": "cloudflare"}))
+check("401 → 说凭据不对，且点明 Token 按实例发", "Token" in _m and "实例" in _m, _m)
+check("401 不说成没权限", "没有读取权限" not in _m, _m)
+
+_m = app.friendly_http(_http_err(403, {}))
+check("两个标记都没有时如实说分不清", "看不出" in _m, _m)
+
+print("\n== 13. 并发去重 ==")
 reset()
 plain = app.jenkins_get
 

@@ -234,6 +234,13 @@ python tools\checkjs.py     # 页面内联 JS 的括号/引号平衡
 7. **PowerShell：`.ps1` 含中文必须存成 UTF-8 with BOM**，否则 PS 5.1 解析报错。
 8. **PowerShell：`Group-Object` 只有一个分组时 `.Count` 返回组内元素数**，不是分组数，要用 `@()` 包住。
 9. **终端里中文占 2 个显示宽度**，`.Length` 算 1，用 `"{0,-44}"` 格式化会错位。
+15. **403 有三种，修法完全不同，别看到 Forbidden 就去查 Token** ——
+    看响应头判断是谁拒的：
+    有 `X-Jenkins` = 请求到了 Jenkins，是**账号没读取权限**（或凭据没生效）；
+    只有 `CF-RAY`、没有 `X-Jenkins` = **Cloudflare WAF 拦的**，请求根本没到 Jenkins，
+    多半是这台服务器的出口 IP 不在白名单（办公网通、机房 403 就是这条）；
+    401 才是**用户名/Token 不对**，而且 Token 是按实例发的，A 站的拿到 B 站一律 401。
+    `friendly_http()` 已经按这三层出提示，别退回成一句 "HTTP 403"。
 10. **「未发布」可能是被 `JENKINS_MAX_BUILDS` 截断了** —— Jenkins 只给最近 N 次构建。
     若这 N 次全都晚于时间窗，窗口内那次根本没被拿到，会误报成漏发，
     然后你去重发一个其实已经发过的站点。现在这种情况会单独告警，别把告警去掉。

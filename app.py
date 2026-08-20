@@ -318,10 +318,12 @@ def admin_deploy_jobs(force=False):
     try:
         data = jenkins_get(path + _q("jobs[name]"), ADMIN_USER, ADMIN_TOKEN,
                            timeout=60, base=ADMIN_URL)
+    except urllib.error.HTTPError as ex:
+        return [], ["后台 Jenkins（%s）：%s" % (ADMIN_URL,
+                    friendly_http(ex, "%s 视图" % ADMIN_DEPLOY_VIEW))]
     except Exception as ex:
         return [], ["连不上后台 Jenkins 的「%s」视图（%s）：%s。"
-                    "检查 ADMIN_JENKINS_URL / 账号 Token / 视图名，"
-                    "以及这台服务器能不能访问那个地址。"
+                    "检查 ADMIN_JENKINS_URL 和这台服务器到那个地址的网络。"
                     % (ADMIN_DEPLOY_VIEW, ADMIN_URL,
                        str(getattr(ex, "reason", ex))[:120])]
     names = [j.get("name") for j in (data.get("jobs") or []) if j.get("name")]
@@ -355,6 +357,9 @@ def fetch_admin_builds(force=False):
         try:
             data = jenkins_get(path + _q(_BUILD_FIELDS % MAX_BUILDS_PER_JOB),
                                ADMIN_USER, ADMIN_TOKEN, timeout=60, base=ADMIN_URL)
+        except urllib.error.HTTPError as ex:
+            warns.append("后台 Jenkins：%s" % friendly_http(ex, name))
+            continue
         except Exception as ex:
             warns.append("后台 Jenkins 的「%s」没拉到：%s"
                          % (name, str(getattr(ex, "reason", ex))[:120]))
@@ -371,6 +376,43 @@ def tz_label():
     """当前进程时区，形如 'IST +0530'。页面上要显示出来 —— 否则用户拿它和
     Jenkins 页面的时间对不上，会以为工具查错了（实际只是时区不同）。"""
     return "%s %s" % (time.strftime("%Z"), time.strftime("%z"))
+
+
+def friendly_http(e, where=""):
+    """把 HTTP 错误翻译成「该去改什么」。
+
+    401 和 403 是两回事，403 还分两层，三种情况的修法南辕北辙：
+      • WAF 403（响应头有 CF-RAY、**没有** X-Jenkins）—— 请求根本没到 Jenkins。
+        要么 UA 被拦（本工具已伪装浏览器 UA），要么**这台服务器的出口 IP 不在白名单**。
+        实测过：办公网能通、机房服务器 403，就是这一条。
+      • Jenkins 403（响应头有 X-Jenkins）—— 认证过了但**这个账号没有读取权限**，
+        或者压根没带上凭据（按匿名处理）。去 Jenkins 里给权限。
+      • 401 —— 用户名或 Token 不对。注意用户名要填**登录名不是邮箱**，
+        而且 Token 是**按实例**发的，A 站的 Token 在 B 站一律 401。
+    不分层就只能看到一句 Forbidden，然后在错误的方向上排查半天。
+    """
+    hdrs = {}
+    try:
+        hdrs = {k.lower(): v for k, v in dict(e.headers).items()}
+    except Exception:
+        pass
+    at = ("「%s」" % where) if where else ""
+    if e.code == 401:
+        return ("%s认证失败（401）：用户名或 API Token 不对。用户名填**登录名不是邮箱**；"
+                "Token 必须是在**这台 Jenkins** 上生成的（每个实例各发各的，拿别台的一律 401）。" % at)
+    if e.code == 403:
+        if "x-jenkins" in hdrs:
+            return ("%sJenkins 拒绝了（403，响应头有 X-Jenkins=%s，说明请求已经到达 Jenkins）："
+                    "凭据没被认出来、或这个账号没有读取权限。先确认 .env 里的用户名/Token 确实生效了"
+                    "（改完要 `docker compose up -d --build`），再让管理员给这个账号 Overall/Read。"
+                    % (at, hdrs.get("x-jenkins")))
+        if "cf-ray" in hdrs or "cloudflare" in hdrs.get("server", ""):
+            return ("%s被 Cloudflare WAF 拦了（403，只有 CF-RAY 没有 X-Jenkins，"
+                    "请求**没到 Jenkins**）：多半是这台服务器的出口 IP 不在白名单里。"
+                    "同样的请求在办公网能通、在机房服务器 403，就是这个原因 —— "
+                    "把服务器出口 IP 加进 WAF 白名单。" % at)
+        return "%s返回 403，但看不出是 WAF 还是 Jenkins 拒的（响应头里两个标记都没有）。" % at
+    return "%sJenkins 返回 HTTP %d" % (at, e.code)
 
 
 def friendly_neterr(e):
@@ -1355,10 +1397,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._send(200, json.dumps(res, ensure_ascii=False), "application/json")
         except urllib.error.HTTPError as e:
-            msg = "Jenkins 返回 HTTP %d" % e.code
+            msg = friendly_http(e)
             if e.code in (401, 403):
-                msg += "（认证失败：用户名或 API Token 不对）"
-                self._send(200, json.dumps({"error": msg, "needCreds": True}, ensure_ascii=False), "application/json")
+                self._send(200, json.dumps({"error": msg, "needCreds": e.code == 401},
+                                           ensure_ascii=False), "application/json")
                 return
             self._send(200, json.dumps({"error": msg}, ensure_ascii=False), "application/json")
         except urllib.error.URLError as e:
