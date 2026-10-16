@@ -525,5 +525,54 @@ check("每个 job 只拉一次", len([c for c in CALLS if c.startswith("/job/")]
       len([c for c in CALLS if c.startswith("/job/")]))
 app.jenkins_get = plain
 
+print("\n== 14. 一行多个分组 + 分支简写 ==")
+# 10-16 真实发布单：这一行以前被静默丢掉，报告里 Pages 整个消失
+c, w = app.parse_components("    Web-Pages            →   分支：非中台 uat  /  中台 v3-uat")
+got = sorted((x["name"], x["group"], x["expect"]) for x in c)
+check("拆成两个分组", got == [("Pages", "中台", "v3-uat"), ("Pages", "非中台", "uat")], (got, w))
+check("不弹告警", not w, w)
+c, w = app.parse_components("    web → 分支：中台 feature/v3、非中台 masterBranch/main-3.04、ar046 uat")
+got = sorted((x["group"], x["site"], x["expect"]) for x in c)
+check("顿号分隔 + 站点级特例 + 值里带 /",
+      got == [("", "AR046", "uat"), ("中台", "", "feature/v3"), ("非中台", "", "masterBranch/main-3.04")], got)
+# 老写法的括号限定词不能被新分支抢走
+c, w = app.parse_components("    web → tag（中台）: feature/v3")
+check("老写法 tag（中台）仍归到「中台」", [(x["group"], x["expect"]) for x in c] == [("中台", "feature/v3")], c)
+c, w = app.parse_components("    LotteryApi  →  分支：  master_V3.11_015")
+check("普通单值行不受影响", [(x["name"], x["expect"]) for x in c] == [("LotteryApi", "master_V3.11_015")], c)
+# 认得组件但值看不懂：必须告警，不许静默
+c, w = app.parse_components("    Web-Pages → 分支：看情况 随便")
+check("看不懂的值要告警", not c and any("没看懂" in x for x in w), (c, w))
+# 站点行不能被当成组件行
+c, w = app.parse_components("（尼日利亚）AR004→fb999 备注 xx")
+check("站点行不误吃、不误报", not c and not w, (c, w))
+
+for title, want in (("中台站", "中台"), ("非中台站（1个）", "非中台"), ("中台站点", "中台"),
+                    ("非中台版本分支", "非中台"), ("中台站(8个)", "中台")):
+    check(f"分组标题「{title}」归一成「{want}」", app.canon_group(title) == want, app.canon_group(title))
+
+check("简写 v3-uat 对上 feature/v3-uat", app.ref_matches("refs/remotes/origin/feature/v3-uat", "v3-uat"))
+check("简写 main-3.04 对上 masterBranch/main-3.04", app.ref_matches("origin/masterBranch/main-3.04", "main-3.04"))
+check("uat 不能对上 feature/v3-uat", not app.ref_matches("feature/v3-uat", "uat"))
+check("uat 对 uat", app.ref_matches("origin/uat", "uat"))
+check("v3 不能对上 feature/v3-uat", not app.ref_matches("feature/v3-uat", "v3"))
+
+GROUPED_INLINE = """【发布站点】
+中台站
+（印度）AR001→site1
+非中台站（1个）
+（印度）AR002→site2
+
+【发布步骤】
+    Web-Pages   →  分支：非中台 master_V3.07_009 / 中台 V3.08_001
+"""
+reset()
+add("AR001-Pages-印度-site1", [mkbuild(10, NOW, tag="feature/V3.08_001", param="BRANCH_NAME")])
+r14 = run(GROUPED_INLINE)
+s14 = {x["job"]: x["state"] for x in r14["rows"]}
+check("端到端：中台 feature/V3.08_001 按简写判 OK", s14.get("AR001-Pages-印度-site1") == "OK", s14)
+check("端到端：非中台按自己分组的期望判 VER", s14.get("AR002-Pages-印度-site2") == "VER", s14)
+add("AR001-Pages-印度-site1", [mkbuild(10, NOW, param="BRANCH_NAME")])
+
 print("\n" + ("全部通过" if not fails else "失败 %d 项：%s" % (len(fails), fails)))
 sys.exit(1 if fails else 0)

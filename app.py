@@ -457,6 +457,15 @@ def normalize_ref(s):
     return s
 
 
+def ref_matches(actual, expect):
+    """
+    发布单常写分支简写：v3-uat = feature/v3-uat、main-3.04 = masterBranch/main-3.04。
+    按「/ 分段的尾部」对齐，不做子串匹配 —— uat 不能匹配 feature/v3-uat。
+    """
+    a, e = normalize_ref(actual), normalize_ref(expect)
+    return a == e or a.endswith("/" + e)
+
+
 def site_of(job_name):
     m = re.match(r"^(AR\d+)-", job_name)
     return m.group(1) if m else ""
@@ -491,8 +500,9 @@ def canon_group(s):
     只剥尾缀，不动词头 —— 「非中台」不能被剥成「中台」。
     """
     s = re.sub(r"[\s:：]+", "", (s or "").strip())
+    s = re.sub(r"[（(][^）)]*[）)]", "", s)   # 「非中台站（1个）」里的计数
     for _ in range(4):   # 「中台版本分支」要连剥两次
-        new = re.sub(r"(站点|站台|版本|分支|标签|tag|的)$", "", s, flags=re.IGNORECASE)
+        new = re.sub(r"(站点|站台|站|版本|分支|标签|tag|的)$", "", s, flags=re.IGNORECASE)
         if new == s:
             break
         s = new
@@ -543,6 +553,39 @@ _COMP_LINE = re.compile(
 )
 # 限定词行：出现在某个组件名下面，形如「非中台版本分支：main-3.04」「ar046（xx）：uat」
 _QUAL_LINE = re.compile(r"^\s*(?P<label>[^:：]+?)\s*[:：]\s*(?P<val>\S+)\s*$")
+
+_ARROW = re.compile(r"→|->|=>|➔|⇒|➜")
+# D) 一行写多个分组：「Web-Pages → 分支：非中台 uat / 中台 v3-uat」。
+# 值里有空格，_COMP_LINE 的 \S+ 吃不下，以前整行被静默丢掉，报告里那个组件直接消失。
+_MULTI_LINE = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9_\- 一-龥]+?)\s*[:：]?\s*(?:→|->|=>|➔|⇒|➜)\s*"
+    r"(?:(?:tag|分支|branch|标签|tag名|分支名)\s*)?[:：]?\s*(?P<rest>.+?)\s*$",
+    re.IGNORECASE,
+)
+# 分组之间的分隔符。/ 必须两边带空格才算分隔 —— 分支名本身就带 /（feature/v3）
+_MULTI_SEP = re.compile(r"\s+/\s+|[；;、，,|]")
+_MULTI_PART = re.compile(r"^(?P<label>[^\s:：]+?)\s*[:：]?\s*(?P<val>\S+)$")
+
+
+def parse_multi(rest):
+    """「非中台 uat / 中台 v3-uat」-> [(group, site, val), ...]；有一段看不懂就整体返回 None。"""
+    out = []
+    for part in _MULTI_SEP.split(rest):
+        part = part.strip()
+        if not part:
+            continue
+        m = _MULTI_PART.match(part)
+        if not m or not _VALUE_OK.search(m.group("val")):
+            return None
+        label = m.group("label")
+        codes = parse_sites(label)
+        if codes:
+            out.append(("", codes[0], m.group("val")))
+        elif re.search(r"[一-龥]", label) and canon_group(label):
+            out.append((canon_group(label), "", m.group("val")))
+        else:
+            return None          # 「feature/v3 xxx」之类，不是「分组 值」结构
+    return out or None
 
 
 # 拼错一个字母，这个组件就整个不核对 —— 而「没核对」在报告里长得跟「没问题」一模一样。
@@ -646,6 +689,28 @@ def parse_components(text):
         if not line.strip():
             continue
         m = _COMP_LINE.match(line)
+        # 老写法优先；只有老正则吃不下的带箭头行才走 D)，免得改变已有发布单的解析结果
+        mm = None if m else _MULTI_LINE.match(line)
+        if mm and not parse_sites(mm.group("name")):
+            # D) 一行多个分组
+            raw = mm.group("name").strip()
+            name, not_here, sim = resolve_component(raw, fuzzy=True)
+            if name and not not_here:
+                parts = parse_multi(mm.group("rest"))
+                if parts:
+                    if sim:
+                        warns.append(f"发布单里写的「{raw}」在 Jenkins 上没有，"
+                                     f"已按最接近的「{name}」核对（相似度 {sim:.0%}）。"
+                                     f"如果不对，改掉发布单里的拼写再跑一次。")
+                    for g, site, val in parts:
+                        add(name, raw, val, group=g, site=site)
+                    cur_comp, cur_raw = name, raw
+                    continue
+                # 认得组件、看不懂值：必须说出来。静默跳过 = 报告里这个组件消失，像没问题一样
+                warns.append(f"「{line.strip()}」这一行没看懂，{name} 本次未核对。"
+                             f"多个分组请写成「非中台 uat / 中台 v3-uat」，或分行写")
+                cur_comp = None
+                continue
         if m:
             raw = m.group("name").strip()
             val = (m.group("val") or "").strip()
@@ -899,7 +964,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                 # 构建成功了，但既没有 TAG/BRANCH_NAME 参数也没有 lastBuiltRevision，
                 # 无从判断发的是哪个版本。以前这种落 OK（绿色），等于把「没核对」显示成「核对通过」。
                 st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录分支/tag，版本无法核对"
-            elif expect and actual and normalize_ref(actual) != expect:
+            elif expect and actual and not ref_matches(actual, expect):
                 st, detail = "VER", f"#{b['num']} 期望 {c['expect']}，实际 {actual}"
             else:
                 st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
@@ -958,7 +1023,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                 actual = ""
             else:
                 actual = art["ver"]
-                if expect_val and actual and normalize_ref(actual) != expect_val:
+                if expect_val and actual and not ref_matches(actual, expect_val):
                     st = "VER"
                     detail = (f"#{b['num']} {b['time']} 装的是 build_admin #{art['num']}"
                               f"（{actual}），不是发布单要求的 {expect_val}"
@@ -973,7 +1038,7 @@ def run_check(text, date_str, days, exclude, all_sites, force, user, token_):
                               f"（{actual or '版本未记录'}）  by {b['who']}")
         elif expect_val and not actual:
             st, detail = "NOVER", f"#{b['num']} 构建成功，但没记录版本参数，无法核对"
-        elif expect_val and actual and normalize_ref(actual) != expect_val:
+        elif expect_val and actual and not ref_matches(actual, expect_val):
             st, detail = "VER", f"#{b['num']} 期望 {expect_val}，实际 {actual}"
         else:
             st, detail = "OK", f"#{b['num']} {b['time']}  {b['sha']}  by {b['who']}"
@@ -1271,6 +1336,8 @@ $('prob').onchange=()=>{if(window.__d)render(window.__d);};
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // 和后端同一套归一化：Git 插件把分支记成 refs/remotes/origin/xxx，比对前要剥前缀
 const norm=s=>String(s||'').replace(/^refs\/remotes\//,'').replace(/^refs\/heads\//,'').replace(/^origin\//,'');
+// 同后端 ref_matches：发布单写简写 v3-uat 时，实际 feature/v3-uat 也算对上
+const refOk=(a,e)=>{a=norm(a);e=norm(e);return a===e||a.endsWith('/'+e);};
 // 后端给的是时间戳数值。别用 time 字符串去算——Math.max("07-14 16:49") 是 NaN，
 // 会把最旧的标成最新（踩过）。
 const fmtTs=t=>{const d=new Date(t*1000);const p=n=>String(n).padStart(2,'0');
@@ -1379,7 +1446,7 @@ function render(d){
     }
     h+='<div class="grid">';
     rows.forEach(r=>{
-      const diff=r.actual&&norm(r.actual)!==norm(c.expect);
+      const diff=r.actual&&!refOk(r.actual,c.expect);
       const isStale=staleKey.has(r.compKey+'|'+r.site+'|'+r.job);
       const st=isStale?'STALE':r.state;
       h+='<div class="cell s-'+st+'" title="'+esc(r.job+'\n'+
@@ -1397,7 +1464,7 @@ function render(d){
        '<div class="tbwrap"><table><tr><th>状态</th><th>站点</th><th>任务</th><th>实际分支/tag</th>'+
        '<th>SHA</th><th>构建</th><th>时间</th><th>耗时</th><th>触发人</th></tr>';
     rows.forEach(r=>{
-      const diff=r.actual&&norm(r.actual)!==norm(c.expect);
+      const diff=r.actual&&!refOk(r.actual,c.expect);
       const st2=staleKey.has(r.compKey+'|'+r.site+'|'+r.job)?'STALE':r.state;
       h+='<tr><td class="st '+st2+'">'+LABEL[st2]+'</td><td>'+esc(r.site)+
         (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
