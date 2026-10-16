@@ -108,14 +108,19 @@ COMPONENT_ALIAS = {
     "webextendapi": "WebExtendApi", "extendapi": "WebExtendApi",
     "agentapi": "AgentApi",
     "webagent": "Web", "agentweb": "Web",
+    # 发布单有时写中文「代理后台」= Agent_Web 视图（组件 Web）。不能归到 NOT_IN_JENKINS 的「后台」
+    "代理后台": "Web", "代理前端": "Web", "代理web": "Web",
     "thirdapi": "ThirdApi",
     "thirdjob": "ThirdJob",
 }
 
 
 def canon(s):
-    """组件名归一：小写 + 去空格/连字符/下划线。发布单里同一个组件有七八种写法。"""
-    return re.sub(r"[\s\-_]+", "", (s or "").strip().lower())
+    """组件名归一：小写 + 去空格/连字符/下划线。发布单里同一个组件有七八种写法。
+    「V1-LotteryApi」「V1-Admin」的 V1 前缀是产品线名，不是组件名的一部分，剥掉 ——
+    否则只能靠近似匹配认，每次核对都弹三四条「已按最接近的…核对」。"""
+    s = re.sub(r"[\s\-_]+", "", (s or "").strip().lower())
+    return re.sub(r"^v1(?=[a-z一-龥])", "", s)
 # 组件 -> Jenkins 视图名，页面上按视图分组展示
 COMPONENT_VIEW = {
     "Pages": "Web-Pages", "LotteryApi": "LotteryApi", "AgentApi": "AgentApi",
@@ -562,8 +567,9 @@ _MULTI_LINE = re.compile(
     r"(?:(?:tag|分支|branch|标签|tag名|分支名)\s*)?[:：]?\s*(?P<rest>.+?)\s*$",
     re.IGNORECASE,
 )
-# 分组之间的分隔符。/ 必须两边带空格才算分隔 —— 分支名本身就带 /（feature/v3）
-_MULTI_SEP = re.compile(r"\s+/\s+|[；;、，,|]")
+# 分组之间的分隔符。半角 / 必须两边带空格才算分隔 —— 分支名本身就带 /（feature/v3）；
+# 全角 ／ ｜ 不会出现在分支名里，怎么写都算（10-16 真实发布单用的就是全角 ／）
+_MULTI_SEP = re.compile(r"\s+/\s+|\s*[／｜]\s*|[；;、，,|]")
 _MULTI_PART = re.compile(r"^(?P<label>[^\s:：]+?)\s*[:：]?\s*(?P<val>\S+)$")
 
 

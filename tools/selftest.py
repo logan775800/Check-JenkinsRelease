@@ -547,6 +547,26 @@ check("看不懂的值要告警", not c and any("没看懂" in x for x in w), (c
 c, w = app.parse_components("（尼日利亚）AR004→fb999 备注 xx")
 check("站点行不误吃、不误报", not c and not w, (c, w))
 
+# 10-16 第二份真实发布单：V1- 前缀、中文「代理后台」、全角 ／ 分隔
+REAL_1016 = """V1-LotteryApi                    →  分支：master_V3.11_015
+\t\t\t\tV1-WebExtendApi                  →  分支：master_V3.11_015
+\t\t\t\tV1-WebIntranetApi                →  分支：master_V3.11_015\t\t\t\t
+\t\t\t\tAgentApi                         →  分支： master
+\t\t\t\t代理后台                          →  分支：master
+\t\t\t\tWeb                              →  分支：非中台 uat ／ 中台 v3-uat
+"""
+c, w = app.parse_components(REAL_1016)
+got = sorted((x["name"], x["group"], x["expect"]) for x in c)
+check("真实发布单 10-16 全部认出", got == sorted([
+    ("LotteryApi", "", "master_V3.11_015"), ("WebExtendApi", "", "master_V3.11_015"),
+    ("WebIntranetApi", "", "master_V3.11_015"), ("AgentApi", "", "master"), ("Web", "", "master"),
+    ("Pages", "非中台", "uat"), ("Pages", "中台", "v3-uat")]), got)
+check("V1- 前缀不弹「已按最接近的」", not any("最接近" in x for x in w), w)
+for spell in ("V1-Admin", "v1 admin"):
+    check(f"{spell} 归到后台", app.canon(spell) in app.NOT_IN_JENKINS, app.canon(spell))
+c, w = app.parse_components("    Web → 分支：非中台 uat｜中台 v3-uat")
+check("全角 ｜ 不带空格也能分", len(c) == 2, (c, w))
+
 for title, want in (("中台站", "中台"), ("非中台站（1个）", "非中台"), ("中台站点", "中台"),
                     ("非中台版本分支", "非中台"), ("中台站(8个)", "中台")):
     check(f"分组标题「{title}」归一成「{want}」", app.canon_group(title) == want, app.canon_group(title))
