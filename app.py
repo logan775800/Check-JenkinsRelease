@@ -1396,7 +1396,8 @@ function render(d){
   // 「需要处理」都回答不了这个，要按站点汇总，发完的排最前。NOJOB（该站没有这个组件）不计数。
   const bySite={};
   d.rows.forEach(r=>{
-    if(r.state==='NOJOB')return;
+    // 「后台构建 build_admin」「后台部署」是汇总行不是站点，算进来会多出一个假站点、总数也多 1
+    if(r.state==='NOJOB'||!/^AR\d+$/.test(r.site))return;
     const st=staleKey.has(r.compKey+'|'+r.site+'|'+r.job)?'STALE':r.state;
     const s=bySite[r.site]=bySite[r.site]||{site:r.site,name:'',n:0,ok:0,run:0,miss:[],bad:[],last:0};
     const cn=(r.view||r.comp)+(r.jobSuffix?'('+r.jobSuffix+')':'');
