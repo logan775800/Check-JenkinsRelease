@@ -1207,6 +1207,10 @@ td a{color:inherit}
 .h2r{margin-left:auto;font-size:12px;font-weight:400}
 .lnk{color:var(--run);cursor:pointer;text-decoration:underline;font-size:12.5px}
 #poll{color:var(--run);font-size:12.5px;margin-top:8px}
+.sp{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+.sc{padding:5px 10px;border-radius:7px;font-size:12.5px;font-weight:400}
+.sc small{opacity:.8;font-size:11.5px}
+.sech{font-size:13.5px;font-weight:700;margin:14px 0 0}
 </style></head><body><div class="wrap">
 <h1>Jenkins 发版核对</h1>
 <div class="sub">把发布单整段复制粘进来 → 点「开始检查」。站点编号和组件 tag 都自动解析，只读不触发构建。</div>
@@ -1387,13 +1391,50 @@ function render(d){
   // 两处自相矛盾，人会倾向于相信看起来更「正常」的那个。
   const staleKey=new Set(stale.map(r=>r.compKey+'|'+r.site+'|'+r.job));
   const bad=d.rows.filter(r=>BAD.includes(r.state)).concat(stale);
+
+  // ---- 站点进度：发版途中他要先看「哪些站已经全部发完」。按组件铺的网格和几百行的
+  // 「需要处理」都回答不了这个，要按站点汇总，发完的排最前。NOJOB（该站没有这个组件）不计数。
+  const bySite={};
+  d.rows.forEach(r=>{
+    if(r.state==='NOJOB')return;
+    const st=staleKey.has(r.compKey+'|'+r.site+'|'+r.job)?'STALE':r.state;
+    const s=bySite[r.site]=bySite[r.site]||{site:r.site,name:'',n:0,ok:0,run:0,miss:[],bad:[],last:0};
+    const cn=(r.view||r.comp)+(r.jobSuffix?'('+r.jobSuffix+')':'');
+    s.n++; if(r.siteName&&!s.name)s.name=r.siteName;
+    if(st==='OK'){s.ok++;s.last=Math.max(s.last,r.ts||0);}
+    else if(st==='MISS')s.miss.push(cn);
+    else if(st==='RUN'){s.run++;s.miss.push(cn+' 构建中');}
+    else s.bad.push(cn+' '+LABEL[st]);
+  });
+  const S=Object.values(bySite).sort((a,b)=>a.site<b.site?-1:1);
+  const sDone=S.filter(s=>s.ok===s.n).sort((a,b)=>b.last-a.last);   // 刚发完的在前
+  const sBad=S.filter(s=>s.bad.length);
+  const sPart=S.filter(s=>!s.bad.length&&s.ok<s.n&&(s.ok||s.run));
+  const sNone=S.filter(s=>!s.bad.length&&!s.ok&&!s.run);
+  const nm=s=>'<b>'+esc(s.site)+'</b>'+(s.name?' '+esc(s.name):'');
+  h+='<div class="card"><h2 style="margin-top:0">站点进度 <span class="tag">全部发完 '+sDone.length+' / '+S.length+' 站</span></h2>';
+  if(sDone.length)h+='<div class="sech" style="color:var(--ok)">✅ 全部发完（'+sDone.length+'）</div><div class="sp">'+
+    sDone.map(s=>'<span class="sc OK">'+nm(s)+' <small>'+s.n+'/'+s.n+' · '+fmtTs(s.last)+'</small></span>').join('')+'</div>';
+  if(sBad.length)h+='<div class="sech" style="color:var(--warn)">⚠ 有问题（'+sBad.length+'）</div><div class="sp">'+
+    sBad.map(s=>'<span class="sc VER">'+nm(s)+' <small>'+esc(s.bad.join('、'))+
+      (s.miss.length?' · 另缺 '+s.miss.length+' 个':'')+'</small></span>').join('')+'</div>';
+  if(sPart.length)h+='<div class="sech" style="color:var(--run)">⏳ 发了一部分（'+sPart.length+'）</div><div class="sp">'+
+    sPart.map(s=>'<span class="sc RUN">'+nm(s)+' <small>'+s.ok+'/'+s.n+' · 缺 '+esc(s.miss.join('、'))+'</small></span>').join('')+'</div>';
+  if(sNone.length)h+='<div class="sech" style="color:var(--mut)">○ 还没开始（'+sNone.length+'）</div><div class="sp">'+
+    sNone.map(s=>'<span class="sc NOJOB">'+nm(s)+'</span>').join('')+'</div>';
+  h+='</div>';
+
   if(bad.length){
-    h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+bad.length+' 项</span>'+
+    // 发版途中「未发布」能有几百条，平铺会把真正要处理的（失败/版本不符/落后）淹掉。
+    // 未发布按站点已经在上面「站点进度」里了，这里收起来，展开仍可逐条看。
+    const badX=bad.filter(r=>r.state!=='MISS'), badM=bad.filter(r=>r.state==='MISS');
+    h+='<div class="card"><h2 style="margin-top:0">需要处理 <span class="tag">'+badX.length+' 项'+
+       (badM.length?' · 另有未发布 '+badM.length+' 项':'')+'</span>'+
        '<span class="h2r"><button class="sec" id="copybad">复制清单</button></span></h2>'+
-       '<div id="poll"></div><div class="tbwrap"><table>'+
-       // 分支和构建时间必须直接摆在这张表里：判断「这条要不要现在处理」靠的就是
-       // 它发的哪个分支、什么时候发的。塞在说明里要读一句话才能拼出来。
-       '<tr><th>状态</th><th>站点</th><th>任务</th><th>分支/tag</th><th>SHA</th>'+
+       '<div id="poll"></div>';
+    // 分支和构建时间必须直接摆在这张表里：判断「这条要不要现在处理」靠的就是
+    // 它发的哪个分支、什么时候发的。塞在说明里要读一句话才能拼出来。
+    const thead='<tr><th>状态</th><th>站点</th><th>任务</th><th>分支/tag</th><th>SHA</th>'+
        '<th>构建时间</th><th>说明</th></tr>';
     bad.sort((a,b)=>BAD.indexOf(a.state)-BAD.indexOf(b.state)||(b.ts||0)-(a.ts||0));
     // 构建号、时间、SHA 现在都有自己的列了，说明里再写一遍纯属占地方。
@@ -1402,13 +1443,18 @@ function render(d){
     const brief=r=>r.state==='STALE'?r.detail
       :(String(r.detail||'').replace(/^#\d+\s*/,'')
         .replace(/\s*\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?\s*/,' ').trim()||'—');
-    bad.forEach(r=>{h+='<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
+    const tr=r=>'<tr><td class="st '+r.state+'">'+LABEL[r.state]+'</td><td>'+esc(r.site)+
       (r.siteName?' <small>'+esc(r.siteName)+'</small>':'')+'</td><td>'+
       (r.url?'<a href="'+esc(r.url)+'" target="_blank">'+esc(r.job||'-')+'</a>':esc(r.job||'-'))+
       '</td><td>'+esc(r.actual||r.expect||'—')+'</td><td><code>'+esc(r.sha||'—')+'</code></td>'+
       '<td>'+esc(r.time||'—')+(r.num?' <small>#'+r.num+'</small>':'')+'</td>'+
-      '<td>'+esc(brief(r))+'</td></tr>';});
-    h+='</table></div>';
+      '<td>'+esc(brief(r))+'</td></tr>';
+    // bad 刚按严重程度排过序，重新拆一次才能保持顺序
+    const bX=bad.filter(r=>r.state!=='MISS'), bM=bad.filter(r=>r.state==='MISS');
+    if(bX.length)h+='<div class="tbwrap"><table>'+thead+bX.map(tr).join('')+'</table></div>';
+    else h+='<div class="sub" style="margin:6px 0 0">没有构建失败 / 版本不符 / 代码落后的项。</div>';
+    if(bM.length)h+='<details><summary>展开未发布明细（'+bM.length+' 项 · 按站点看上面「站点进度」更直观）</summary>'+
+      '<div class="tbwrap"><table>'+thead+bM.map(tr).join('')+'</table></div></details>';
     if(stale.length){
       h+='<div class="sub" style="margin:10px 0 0">「代码落后」＝同一个分支名下出现了'+
          '不止一个 SHA。分支是可变指针，这些站点构建时分支顶端还没有后来的提交，'+
