@@ -32,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime
 
 import app
 from slack_bolt import App
@@ -91,6 +92,24 @@ def _cred(which):
 def jget(which, path, timeout=60):
     base, u, t = _cred(which)
     return app.jenkins_get(path, u, t, timeout=timeout, base=base)
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def console_tail(which, job, num, n=20, max_bytes=8 * 1024 * 1024):
+    """失败构建日志的最后 n 行。整份 consoleText 拉下来取尾巴：失败不常见，换来的是不依赖 progressiveText 的边界行为。"""
+    base, u, t = _cred(which)
+    req = urllib.request.Request(base + "/job/%s/%s/consoleText" % (q(job), num))
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{u}:{t}".encode()).decode())
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JenkinsReleaseBot/1.0")
+    with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r:
+        raw = r.read(max_bytes)
+    lines = [_ANSI.sub("", ln).rstrip() for ln in raw.decode("utf-8", "replace").splitlines()]
+    # Pipeline 日志结尾是一长串「[Pipeline] }」「[Pipeline] // node」收尾行，不滤掉的话
+    # 最后 20 行全是它们，真正的报错反而被挤出去
+    lines = [ln[:200] for ln in lines if ln.strip() and not ln.lstrip().startswith("[Pipeline]")]
+    return lines[-n:]
 
 
 def _ssl_ctx():
@@ -332,8 +351,11 @@ HELP = (
     "2. `@jenkins-bot AR047` 出这个站的发布计划，核对后点 *确认发布*\n"
     "3. 站点分组不明时：`@jenkins-bot AR047 中台`（记住，下次不用再说）\n"
     "4. `@jenkins-bot 当前` 看记着的服务清单\n"
-    "后台：build_admin 你自己先打包，我只核对版本对不对，对了才发本站后台。"
+    "5. `@jenkins-bot 站点` 换行贴这次要发的站点清单（整份发布单也行），之后 `@jenkins-bot 进度` 看哪些站发完了\n"
+    "后台：build_admin 同一版本只打一次包，版本已对上就直接发本站后台。\n"
+    "发布失败时结论里会附构建日志最后几行，并带 *重发失败的* 按钮。"
 )
+MAX_PLAN_SITES = 5          # 一次最多出几个站的计划：防止把站点清单误当成「发这些站」刷出几十条计划
 
 
 def strip_mention(text):
@@ -367,15 +389,103 @@ def cmd_services(channel, text, user):
                 "Web             →  分支：非中台 uat ／ 中台 v3-uat```" +
                 ("\n" + "\n".join("⚠ " + w for w in warns) if warns else ""))
     groups = {k: v for k, v in app.parse_groups(text).items() if v}
+    sites = app.parse_sites(text)
     with _state_lock:
-        STATE["channels"][channel] = {"comps": comps, "by": user, "at": time.time()}
+        old = STATE["channels"].get(channel) or {}
+        ch = {"comps": comps, "by": user, "at": time.time(), "text": text,
+              # 整份发布单里带了站点就顺便记下站点清单；没带就沿用之前 @站点 记的
+              "sites": sites or old.get("sites", []), "sites_text": text if sites else old.get("sites_text", "")}
+        STATE["channels"][channel] = ch
         STATE["site_groups"].update(groups)
         save_state(STATE)
     out = ["已记下 %d 个服务（之后 @我 站点编号就按这份出计划）：" % len(comps)]
     out += [comp_line(c) for c in comps]
     if groups:
         out.append("站点分组也记住了：" + "、".join("%s=%s" % kv for kv in sorted(groups.items())))
+    if sites:
+        out.append("站点清单也记下了：%d 个站，`@jenkins-bot 进度` 可以看发完了哪些" % len(sites))
     out += ["⚠ " + w for w in warns]
+    return "\n".join(out)
+
+
+def cmd_sites(channel, text, user):
+    sites = app.parse_sites(text)
+    if not sites:
+        return "没认出站点编号。格式像发布单里那样：`（印度）AR001→SiteA`，一行一个。"
+    groups = {k: v for k, v in app.parse_groups(text).items() if v}
+    with _state_lock:
+        ch = STATE["channels"].setdefault(channel, {"comps": [], "by": user, "at": time.time(), "text": ""})
+        ch.update(sites=sites, sites_text=text)
+        STATE["site_groups"].update(groups)
+        save_state(STATE)
+    gs = {}
+    for s in sites:
+        gs.setdefault(groups.get(s) or "未分组", []).append(s)
+    return "已记下这次发版的 %d 个站点（%s）。`@jenkins-bot 进度` 看哪些发完了。" % (
+        len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items()))
+
+
+def cmd_progress(channel):
+    """
+    这次发版的站点进度：哪些站全部发完、哪些有问题、哪些发了一部分、哪些还没开始。
+    直接用网页版的 run_check（同一套解析、同一套判定），时间窗从记下服务清单那天到今天。
+    """
+    ch = STATE["channels"].get(channel)
+    if not ch or not ch.get("comps"):
+        return "这个频道还没记服务清单。先 `@jenkins-bot 服务` 贴发布单。"
+    if not ch.get("sites"):
+        return ("我不知道这次要发哪些站。发 `@jenkins-bot 站点` 换行贴站点清单（或者把整份发布单贴进 `@jenkins-bot 服务`），"
+                "我才能算出还有哪些没发。")
+    text = ch.get("text", "")
+    if ch.get("sites_text") and ch["sites_text"] != text:
+        text = ch["sites_text"] + "\n" + text          # 站点清单在前：分组标题要先于站点行出现
+    d0 = datetime.fromtimestamp(ch["at"]).date()
+    days = (datetime.now().date() - d0).days + 1
+    r = app.run_check(text, d0.strftime("%Y-%m-%d"), days, ["AR000"], False, True, J_USER, J_TOKEN)
+    if not r.get("ok"):
+        return "算进度失败：" + "；".join(r.get("warnings") or ["没解析出内容"])
+    by = {}
+    for x in r["rows"]:
+        if x["state"] == "NOJOB" or not re.match(r"^AR\d+$", x["site"]):
+            continue                                     # 「后台构建」那种汇总行不算站点
+        s = by.setdefault(x["site"], {"name": x.get("siteName") or "", "n": 0, "ok": 0, "run": 0,
+                                       "miss": [], "bad": [], "last": 0})
+        view = x.get("view") or x["comp"]
+        s["n"] += 1
+        if x["state"] == "OK":
+            s["ok"] += 1
+            s["last"] = max(s["last"], x.get("ts") or 0)
+        elif x["state"] == "MISS":
+            s["miss"].append(view)
+        elif x["state"] == "RUN":
+            s["run"] += 1
+            s["miss"].append(view + " 构建中")
+        else:
+            s["bad"].append("%s %s" % (view, {"VER": "版本不符", "FAIL": "构建失败", "NOVER": "版本未知"}.get(
+                x["state"], x["state"])))
+    S = sorted(by.items())
+    done = sorted([kv for kv in S if kv[1]["ok"] == kv[1]["n"]], key=lambda kv: -kv[1]["last"])
+    bad = [kv for kv in S if kv[1]["bad"]]
+    part = [kv for kv in S if not kv[1]["bad"] and kv[1]["ok"] < kv[1]["n"] and (kv[1]["ok"] or kv[1]["run"])]
+    none = [kv for kv in S if not kv[1]["bad"] and not kv[1]["ok"] and not kv[1]["run"]]
+    nm = lambda k, s: "%s %s" % (k, s["name"]) if s["name"] else k
+    out = ["*发版进度：全部发完 %d / %d 站*（时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days)]
+    if done:                                  # 他要的：全部发完的放最前，最近发完的在前
+        out.append("\n✅ *全部发完（%d）*" % len(done))
+        out.append("　" + "　".join("%s(%s)" % (k, fmt_ts(s["last"])[6:]) for k, s in done))
+    if bad:
+        out.append("\n⚠ *有问题（%d）*" % len(bad))
+        out += ["• %s：%s" % (nm(k, s), "、".join(s["bad"])) for k, s in bad]
+    if part:
+        out.append("\n⏳ *发了一部分（%d）*" % len(part))
+        out += ["• %s %d/%d，缺 %s" % (nm(k, s), s["ok"], s["n"], "、".join(s["miss"])) for k, s in part]
+    if none:
+        out.append("\n○ *还没开始（%d）*" % len(none))
+        out.append("　" + "　".join(k for k, _ in none))
+    miss_sites = [s for s in ch["sites"] if s not in by]
+    if miss_sites:
+        out.append("\n❓ 清单里有、但 Jenkins 上没有这些服务的 job：" + "　".join(miss_sites))
+    out += ["⚠ " + w for w in (r.get("warnings") or [])]
     return "\n".join(out)
 
 
@@ -601,6 +711,30 @@ def _end_ts(t):
     return (b.get("ts") or 0) + (b.get("dur") or 0)
 
 
+def _retryable(t):
+    """哪些值得一键重发：构建失败/被中止、触发失败、在队列被取消、后台没发成。
+    不含：发错（重发大概率还是错，要先查原因）、超时（可能还在跑，重发会叠一次）、跳过（本来就在构建）。"""
+    st = t.get("state")
+    if st in ("trigger_err", "cancelled", "admin_err"):
+        return True
+    return st == "done" and (t.get("build") or {}).get("result") != "SUCCESS"
+
+
+def retry_blocks(rp, pid):
+    names = "、".join(t["view"] for t in rp["targets"])
+    return [{"type": "actions", "elements": [
+                {"type": "button", "action_id": "confirm", "style": "primary", "value": pid,
+                 "text": {"type": "plain_text", "text": "重发失败的 %d 个" % len(rp["targets"])},
+                 "confirm": {"title": {"type": "plain_text", "text": "重发"},
+                             "text": {"type": "mrkdwn", "text": "重新触发 *%s* 的：%s？" % (rp["site"], names)},
+                             "confirm": {"type": "plain_text", "text": "重发"},
+                             "deny": {"type": "plain_text", "text": "先不"}}},
+                {"type": "button", "action_id": "cancel", "value": pid,
+                 "text": {"type": "plain_text", "text": "不重发"}}]},
+            {"type": "context", "elements": [{"type": "mrkdwn",
+             "text": "参数和刚才一样；15 分钟内有效。先看上面的日志确认原因再点。"}]}]
+
+
 def summary_text(site, disp, targets, user, started):
     """发完后的结论：像 release 机器人那样一张表列出本次每个服务的实际分支，问题项再单独列链接。"""
     cats = {}
@@ -774,9 +908,33 @@ def run_release(p, user, client, resume=None):
                 render()
                 last = snap()
         render(final=True)
-        # 4. 结论单独发一条，@ 确认人，方便手机上看到推送
-        client.chat_postMessage(channel=channel, thread_ts=p.get("thread") or p["ts"],
-                                text=summary_text(site, p.get("disp", ""), targets, user, started))
+        thread = p.get("thread") or p["ts"]
+        # 4a. 构建失败的附日志最后几行：多数时候看这几行就知道原因，省得点进 Jenkins 翻
+        for t in targets:
+            b = t.get("build") or {}
+            if t.get("state") == "done" and b.get("result") != "SUCCESS" and t.get("num"):
+                try:
+                    tail = console_tail(t["which"], t["job"], t["num"])
+                    client.chat_postMessage(channel=channel, thread_ts=thread,
+                                            text="❌ *%s* `%s` #%s 日志最后 %d 行：\n```%s```" % (
+                                                t["view"], t["job"], t["num"], len(tail), "\n".join(tail)))
+                except Exception as e:
+                    log.warning("console tail %s: %s", t["job"], e)
+        # 4b. 结论单独发一条，@ 确认人，方便手机上看到推送；有失败的带「重发失败的」按钮
+        text = summary_text(site, p.get("disp", ""), targets, user, started)
+        blocks = _sections(text)
+        retry = [t for t in targets if _retryable(t)]
+        if retry:
+            pid = uuid.uuid4().hex[:12]
+            rp = {"site": site, "disp": p.get("disp", ""), "channel": channel, "thread": thread,
+                  "at": time.time(), "summary": text,
+                  "head": "*%s %s 重发失败的 %d 个*" % (site, p.get("disp", ""), len(retry)),
+                  "targets": [{k: t[k] for k in ("which", "view", "job", "pname", "value", "admin_ver") if k in t}
+                              for t in retry]}
+            with _plans_lock:
+                PLANS[pid] = rp
+            blocks += retry_blocks(rp, pid)
+        client.chat_postMessage(channel=channel, thread_ts=thread, text=text, blocks=blocks)
     except Exception as e:
         log.exception("run_release failed")
         client.chat_postMessage(channel=channel, thread_ts=p.get("thread") or p["ts"],
@@ -825,6 +983,16 @@ def on_confirm(ack, body, client):
         PLANS.pop(pid)                 # 先摘掉：连点两下不会触发两遍
         RUNNING.add(p["site"])
         p["ts"] = body["message"]["ts"]
+    if p.get("summary"):
+        # 重发：结论消息保留原样（只去掉按钮），进度另起一条消息，别把结论覆盖掉
+        try:
+            client.chat_update(channel=ch, ts=p["ts"], text=p["summary"],
+                               blocks=_sections(p["summary"]) + [{"type": "context", "elements": [
+                                   {"type": "mrkdwn", "text": "<@%s> 已点重发" % user}]}])
+            r = client.chat_postMessage(channel=ch, thread_ts=p["thread"], text=p["head"] + " 开始…")
+            p["ts"] = r["ts"]
+        except Exception:
+            log.exception("retry message failed")
     log.info("confirm %s by %s: %s", p["site"], user, [t["job"] for t in p["targets"]])
     threading.Thread(target=run_release, args=(p, user, client), daemon=True).start()
 
@@ -835,6 +1003,11 @@ def on_cancel(ack, body, client):
     pid = body["actions"][0]["value"]
     with _plans_lock:
         p = PLANS.pop(pid, None)
+    if p and p.get("summary"):        # 「不重发」：保留结论，只去掉按钮
+        client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=p["summary"],
+                           blocks=_sections(p["summary"]) + [{"type": "context", "elements": [
+                               {"type": "mrkdwn", "text": "<@%s> 选了不重发" % body["user"]["id"]}]}])
+        return
     txt = "已取消%s，没有触发任何构建。" % ((" " + p["site"]) if p else "")
     client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=txt,
                        blocks=_sections("~%s~\n%s" % (p["head"] if p else "", txt) if p else txt))
@@ -848,9 +1021,18 @@ def handle(text, channel, user, thread=None, say=None):
         return HELP
     if t.startswith("当前"):
         return cmd_current(channel)
+    if t.startswith("进度"):
+        return cmd_progress(channel)
+    if t.startswith("站点"):
+        return cmd_sites(channel, re.sub(r"^站点(清单)?[:：]?", "", t), user)
     if t.startswith("服务") or app.parse_components(t)[0]:
         return cmd_services(channel, re.sub(r"^服务[:：]?", "", t), user)
-    if app.parse_sites(t):
+    sites = app.parse_sites(t)
+    if len(sites) > MAX_PLAN_SITES:
+        # 几十个站多半是在贴站点清单，不是要一口气发这么多 —— 出几十条计划刷屏还容易误点
+        return ("一次最多出 %d 个站的计划，你发了 %d 个。\n如果这是这次发版的站点清单，请用 `@jenkins-bot 站点` 开头再发一次。"
+                % (MAX_PLAN_SITES, len(sites)))
+    if sites:
         cmd_plan(channel, t, thread, say)
         return None
     return "没看懂。\n" + HELP
