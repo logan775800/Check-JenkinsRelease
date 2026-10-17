@@ -12,6 +12,7 @@ jenkins-bot：在 Slack 里按站点出发布计划（P0：只读，不触发任
 解析发布单、站点/组件识别、分支简写比对全部复用 app.py，两边口径一致。
 跑在 Socket Mode：机器人主动连 Slack，服务器不需要开端口、不需要公网回调地址。
 """
+import html
 import json
 import logging
 import os
@@ -134,7 +135,16 @@ HELP = (
 
 
 def strip_mention(text):
-    return re.sub(r"<@[A-Z0-9]+>", "", text or "").strip()
+    """
+    Slack 发过来的文本要先还原再解析：
+      - 粘贴多行会被自动包成代码块，首行变成 ```V1-LotteryApi、末行值变成 feature/v3-uat```
+        （10-17 实测：LotteryApi 整行没认出、Pages 期望值带了三个反引号）
+      - < > & 会被转成 &lt; &gt; &amp;，「->」到这里是「-&gt;」
+    """
+    t = re.sub(r"<@[A-Z0-9]+>", "", text or "")
+    t = html.unescape(t)
+    t = t.replace("```", "\n").replace("`", "")
+    return t.strip()
 
 
 def fmt_ts(ts):
