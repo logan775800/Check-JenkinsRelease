@@ -95,6 +95,35 @@ def jget(which, path, timeout=60):
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# 报错行：dotnet 的 error CSxxxx/MSBxxxx、各种 Exception、npm ERR!、git fatal 等；warning 行一律不要
+_ERR = re.compile(r"(\berror\b|Exception\b|\bFAILED\b|\bfatal:|npm ERR!|\bERROR\b|Traceback)", re.I)
+_WARN = re.compile(r"\bwarning\b|\b0 Error\(s\)", re.I)     # 「0 Error(s)」是编译汇总，不是报错
+
+
+def console_errors(which, job, num, max_err=8, tail=3, max_bytes=8 * 1024 * 1024):
+    """
+    失败原因：整份日志里挑报错行（完整显示，不截断）+ 最后几行。
+    10-17 AR035 WebExtendApi：最后 20 行里 19 行是编译警告，真正的报错只有一行
+    「error MSB3030 …nlog.config not found」，还被截在 200 字符看不到是哪个文件 —— 只取尾巴不够。
+    """
+    base, u, t = _cred(which)
+    req = urllib.request.Request(base + "/job/%s/%s/consoleText" % (q(job), num))
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{u}:{t}".encode()).decode())
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JenkinsReleaseBot/1.0")
+    with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r:
+        raw = r.read(max_bytes)
+    lines = [_ANSI.sub("", ln).rstrip() for ln in raw.decode("utf-8", "replace").splitlines()]
+    lines = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("[Pipeline]")]
+    errs, seen = [], set()
+    for ln in lines:
+        if _ERR.search(ln) and not _WARN.search(ln) and ln not in seen:
+            seen.add(ln)
+            errs.append(ln[:800])
+    errs = errs[-max_err:]                       # 报错多时取最后几条（越靠后越接近真正失败点）
+    last = [ln[:300] for ln in lines[-tail:] if ln[:800] not in errs]
+    if not errs:                                  # 没认出报错行就退回看尾巴
+        return [ln[:300] for ln in lines[-20:]]
+    return errs + (["…"] if last else []) + last
 
 
 def console_tail(which, job, num, n=20, max_bytes=8 * 1024 * 1024):
@@ -915,10 +944,10 @@ def run_release(p, user, client, resume=None):
             b = t.get("build") or {}
             if t.get("state") == "done" and b.get("result") != "SUCCESS" and t.get("num"):
                 try:
-                    tail = console_tail(t["which"], t["job"], t["num"])
+                    lines = console_errors(t["which"], t["job"], t["num"])
                     client.chat_postMessage(channel=channel, thread_ts=thread,
-                                            text="❌ *%s* `%s` #%s 日志最后 %d 行：\n```%s```" % (
-                                                t["view"], t["job"], t["num"], len(tail), "\n".join(tail)))
+                                            text="❌ *%s* `%s` #%s 报错：\n```%s```" % (
+                                                t["view"], t["job"], t["num"], "\n".join(lines)[:3500]))
                 except Exception as e:
                     log.warning("console tail %s: %s", t["job"], e)
         # 4b. 结论单独发一条，@ 确认人，方便手机上看到推送；有失败的带「重发失败的」按钮
