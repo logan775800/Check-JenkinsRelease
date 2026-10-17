@@ -215,26 +215,109 @@ def branch_switch(last, val):
     return not (_TAG.search(a) and _TAG.search(b))
 
 
-def admin_check(expect):
-    """核对 build_admin 最近一次成功构建的版本。返回 (ok, 说明)。"""
+# build_admin 一个版本只打一次包，后面的站点直接用。
+# _admin_lock 保证「查状态 + 触发」是原子的：两个站前后脚确认，只有第一个会触发，第二个看到在途就等。
+# _admin_inflight 记机器人自己触发、还没出结果的那次（刚进队列时 lastBuild 还看不到它，光查 Jenkins 会重复触发）。
+_admin_lock = threading.Lock()
+_admin_inflight = {}        # version -> {"queue": 队列路径, "num": 构建号}
+
+
+def admin_status(expect):
+    """
+    build_admin 相对发布单版本的状态，返回 (状态, 说明, 构建号)：
+      ready  最近一次成功构建就是这个版本 —— 不用再打包
+      wait   正在打这个版本（他手点的或机器人触发的）—— 等它
+      build  还没打过这个版本 —— 需要执行一次
+      error  读不到
+    """
+    exp = app.normalize_ref(expect)
     try:
         d = jget(ADMIN, "/job/%s/api/json" % q(app.ADMIN_BUILD_JOB) + app._q(
-            "lastBuild[number,building],lastSuccessfulBuild[number,timestamp,"
+            "lastBuild[number,building,actions[parameters[name,value]]],lastSuccessfulBuild[number,timestamp,"
             "actions[parameters[name,value],lastBuiltRevision[SHA1,branch[name]]]]"))
     except Exception as e:
-        return False, "读不到 %s：%s" % (app.ADMIN_BUILD_JOB, str(getattr(e, "reason", e))[:120])
+        return "error", "读不到 %s：%s" % (app.ADMIN_BUILD_JOB, str(getattr(e, "reason", e))[:120]), None
     lb = d.get("lastBuild") or {}
-    if lb.get("building"):
-        return False, "%s #%s 正在构建，等它打完包再来" % (app.ADMIN_BUILD_JOB, lb.get("number"))
+    if lb.get("building") and app.ref_matches(app.read_build(lb)["want"], exp):
+        return "wait", "%s #%s 正在打包 `%s`" % (app.ADMIN_BUILD_JOB, lb.get("number"), exp), lb.get("number")
+    inf = _admin_inflight.get(exp)
+    if inf:
+        return "wait", "%s 已排队打包 `%s`" % (app.ADMIN_BUILD_JOB, exp), inf.get("num")
     ls = d.get("lastSuccessfulBuild")
-    if not ls:
-        return False, "%s 没有成功过的构建" % app.ADMIN_BUILD_JOB
-    b = app.read_build(ls)
-    ver = b["want"] or b["got"]
-    if not app.ref_matches(ver, expect):
-        return False, "%s 最新成功 #%s 是 `%s`，不是 `%s`，先去打包" % (
-            app.ADMIN_BUILD_JOB, b["num"], ver or "?", app.normalize_ref(expect))
-    return True, "%s #%s（%s）= `%s` ✓" % (app.ADMIN_BUILD_JOB, b["num"], b["time"][:11], ver)
+    if ls:
+        b = app.read_build(ls)
+        ver = b["want"] or b["got"]
+        if app.ref_matches(ver, exp):
+            return "ready", "%s #%s（%s）已是 `%s`，不用再打包" % (
+                app.ADMIN_BUILD_JOB, b["num"], b["time"][:11], ver), b["num"]
+        return "build", "%s 最新成功 #%s 是 `%s`，要先打一次 `%s`" % (
+            app.ADMIN_BUILD_JOB, b["num"], ver or "?", exp), None
+    return "build", "%s 还没有成功过的构建，要先打一次 `%s`" % (app.ADMIN_BUILD_JOB, exp), None
+
+
+def _wait_build(which, job, queue=None, num=None, deadline=None, on_progress=None):
+    """等一次构建结束。queue 和 num 至少给一个。返回 read_build 结果；超时/取消返回 None 和原因。"""
+    while time.time() < deadline:
+        try:
+            if num is None:
+                qi = jget(which, queue.rstrip("/") + "/api/json" + app._q("cancelled,executable[number,url]"))
+                if qi.get("cancelled"):
+                    return None, "在队列里被取消"
+                if qi.get("executable"):
+                    num = qi["executable"]["number"]
+                    if on_progress:
+                        on_progress(num)
+            if num is not None:
+                b = jget(which, "/job/%s/%s/api/json" % (q(job), num) + app._q(
+                    "number,result,building,timestamp,duration,url,actions[parameters[name,value],"
+                    "lastBuiltRevision[SHA1,branch[name]]]"))
+                if not b.get("building") and b.get("result"):
+                    return app.read_build(b), ""
+        except urllib.error.HTTPError as e:
+            if not (e.code == 404 and num is None):
+                log.warning("wait %s: %s", job, e)
+        except Exception as e:
+            log.warning("wait %s: %s", job, e)
+        time.sleep(POLL_EVERY)
+    return None, "超时"
+
+
+def ensure_admin_build(expect, deadline, on_progress):
+    """保证 build_admin 有一次成功的 expect 版本。需要时触发一次（同版本全局只触发一次）。返回 (ok, 说明)。"""
+    exp = app.normalize_ref(expect)
+    job = app.ADMIN_BUILD_JOB
+    with _admin_lock:
+        st, note, num = admin_status(exp)
+        if st == "ready":
+            return True, note
+        if st == "error":
+            return False, note
+        queue = None
+        if st == "build":
+            loc = jpost(ADMIN, "/job/%s/buildWithParameters?TAG=%s" % (q(job), q(exp)))
+            queue = urllib.parse.urlparse(loc).path if loc else ""
+            if not queue:
+                return False, "触发了 %s 但 Jenkins 没返回队列地址，请去页面确认" % job
+            _admin_inflight[exp] = {"queue": queue, "num": None}
+            log.info("triggered %s TAG=%s -> %s", job, exp, loc)
+            note = "已触发 %s 打包 `%s`" % (job, exp)
+        else:
+            queue = (_admin_inflight.get(exp) or {}).get("queue")
+    on_progress(note)
+    try:
+        def prog(n):
+            if exp in _admin_inflight:
+                _admin_inflight[exp]["num"] = n
+            on_progress("%s #%s 正在打包 `%s`" % (job, n, exp))
+        b, why = _wait_build(ADMIN, job, queue=queue, num=num, deadline=deadline, on_progress=prog)
+    finally:
+        with _admin_lock:
+            _admin_inflight.pop(exp, None)
+    if not b:
+        return False, "%s 打包 `%s` %s" % (job, exp, why)
+    if b["result"] != "SUCCESS":
+        return False, "%s #%s 打包 `%s` 失败（%s）" % (job, b["num"], exp, b["result"])
+    return True, "%s #%s 打包 `%s` 成功" % (job, b["num"], exp)
 
 
 def admin_site_jobs(site):
@@ -330,16 +413,20 @@ def build_plan(site, comps, group_hint, jobs):
         if c["group"] and (not group or c["group"] != group):
             continue                                    # 分组未知的在下面统一提示
         if c["name"] == app.ADMIN_COMP:
-            ok, note = admin_check(c["expect"])
-            ajobs = admin_site_jobs(site) if ok else []
-            if not ok:
-                lines.append("• *后台 Admin* → ⏭ 不发：%s" % note)
+            st, note, _ = admin_status(c["expect"])
+            ajobs = admin_site_jobs(site) if st != "error" else []
+            if st == "error":
+                lines.append("• *后台 Admin* → ❌ %s，不发" % note)
             elif not ajobs:
                 lines.append("• *后台 Admin* → ❓ 后台 Jenkins 的 %s 视图里没有 %s 的部署 job"
                              % (app.ADMIN_DEPLOY_VIEW, site))
+            step = {"ready": "✓ " + note,
+                    "wait": "⏳ %s，打完再发本站后台" % note,
+                    "build": "① %s（只打这一次，后面的站直接用）② 成功后再发本站后台" % note}.get(st, "")
             for n in ajobs:
-                lines.append("• *后台 Admin* `%s`　不传参数，装 %s" % (n, note))
-                targets.append({"which": ADMIN, "view": "后台 Admin", "job": n, "pname": "", "value": ""})
+                lines.append("• *后台 Admin* `%s`　不传参数\n　　%s" % (n, step))
+                targets.append({"which": ADMIN, "view": "后台 Admin", "job": n, "pname": "", "value": "",
+                                "admin_ver": app.normalize_ref(c["expect"])})
             continue
         # 同一站点同组件可能有多个 job（AR013 的 Pages 有两个），全部列出，一个都不能漏
         names = sorted(n for n, j in site_jobs.items() if j["comp"] == c["name"])
@@ -445,6 +532,8 @@ def _verdict(t):
         return "⏭", "跳过：" + t.get("why", ""), "skip"
     if st == "trigger_err":
         return "❌", "触发失败：" + t.get("why", ""), "bad"
+    if st == "admin_err":
+        return "❌", "没发：" + t.get("why", ""), "bad"
     if st == "cancelled":
         return "❌", "在队列里被取消", "bad"
     if st == "timeout":
@@ -460,6 +549,8 @@ def _verdict(t):
             return "⚠", "发错：传的 `%s`，Git 实际拉到 `%s`" % (want or t["value"], got), "wrong"
         if not got and want and not app.ref_matches(want, t["value"]):
             return "⚠", "发错：实际参数 `%s`，应为 `%s`" % (want, t["value"]), "wrong"
+    if t.get("admin_note"):
+        return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
 
 
@@ -467,6 +558,8 @@ def _line(t):
     link = t.get("url")
     num = ("<%s|#%s>" % (link, t["num"])) if link and t.get("num") else ("#%s" % t["num"] if t.get("num") else "")
     st = t.get("state")
+    if st == "wait_admin":
+        return "⏸ *%s* `%s` 等打包：%s" % (t["view"], t["job"], t.get("why") or "检查 build_admin…")
     if st in ("queued", "triggering"):
         return "⏸ *%s* `%s` 排队中…" % (t["view"], t["job"])
     if st == "running":
@@ -505,12 +598,11 @@ def run_release(p, user, client):
                         continue
                 except Exception:
                     pass
-            t["state"] = "triggering"
+            # 后台部署要等 build_admin 有这个版本的包，先挂起，由下面的 admin_flow 放行
+            t["state"] = "wait_admin" if t.get("admin_ver") else "triggering"
         render()
-        # 2. 逐个触发（间隔 1 秒，别一瞬间打满 WAF）
-        for t in targets:
-            if t["state"] != "triggering":
-                continue
+
+        def trigger(t):
             path = "/job/%s/" % q(t["job"])
             path += ("buildWithParameters?%s=%s" % (t["pname"], q(t["value"]))) if t["pname"] else "build"
             try:
@@ -521,17 +613,49 @@ def run_release(p, user, client):
                 t.update(state="trigger_err", why=app.friendly_http(e, t["job"]))
             except Exception as e:
                 t.update(state="trigger_err", why=str(getattr(e, "reason", e))[:150])
-            time.sleep(1)
+
+        # 2a. 后台：确保 build_admin 有这个版本（同版本全局只打一次），之后再发本站后台。
+        # 单独线程跑，不挡其它服务。
+        admin_ts = [t for t in targets if t["state"] == "wait_admin"]
+
+        def admin_flow():
+            def prog(msg):
+                for t in admin_ts:
+                    if t["state"] == "wait_admin":
+                        t["why"] = msg
+            try:
+                ok, note = ensure_admin_build(admin_ts[0]["admin_ver"], started + RUN_TIMEOUT, prog)
+            except Exception as e:
+                log.exception("admin build failed")
+                ok, note = False, "%s 出错：%s" % (app.ADMIN_BUILD_JOB, str(getattr(e, "reason", e))[:150])
+            for t in admin_ts:
+                if t["state"] != "wait_admin":
+                    continue
+                if ok:
+                    t["admin_note"] = note
+                    trigger(t)
+                else:
+                    t.update(state="admin_err", why=note)
+
+        if admin_ts:
+            threading.Thread(target=admin_flow, daemon=True).start()
+        # 2b. 其它服务逐个触发（间隔 1 秒，别一瞬间打满 WAF）
+        for t in targets:
+            if t["state"] == "triggering":
+                trigger(t)
+                time.sleep(1)
         render()
         # 3. 跟踪：队列 -> 拿到构建号 -> 等构建结束
-        while any(t["state"] in ("queued", "running") for t in targets):
+        snap = lambda: [(t["state"], t.get("num"), t.get("why")) for t in targets]
+        last = snap()
+        while any(t["state"] in ("queued", "running", "wait_admin", "triggering") for t in targets):
             if time.time() - started > RUN_TIMEOUT:
                 for t in targets:
-                    if t["state"] in ("queued", "running"):
+                    if t["state"] in ("queued", "running", "wait_admin", "triggering"):
                         t["state"] = "timeout"
                 break
             time.sleep(POLL_EVERY)
-            changed = False
+            changed = snap() != last          # 后台线程也会改状态，按快照比
             for t in targets:
                 try:
                     if t["state"] == "queued":
@@ -561,8 +685,9 @@ def run_release(p, user, client):
                     log.warning("poll %s: %s", t["job"], e)
                 except Exception as e:
                     log.warning("poll %s: %s", t["job"], e)
-            if changed:
+            if changed or snap() != last:
                 render()
+                last = snap()
         render(final=True)
         # 4. 结论单独发一条，@ 确认人，方便手机上看到推送
         cats = {}
