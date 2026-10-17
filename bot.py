@@ -48,6 +48,7 @@ PARAM_NAMES = ("TAG", "BRANCH_NAME", "BRANCH")   # 同 app.read_build：各类 j
 # 能点「确认发布」的 Slack user id。默认空 = 谁都不能发（安全的默认值），在 /data/release-bot/.env 里配
 ALLOWED = {u.strip() for u in os.environ.get("BOT_ALLOWED_USERS", "").split(",") if u.strip()}
 PLAN_TTL = 15 * 60          # 计划出了 15 分钟没确认就作废：Jenkins 状态可能已经变了
+STALE_SERVICES = float(os.environ.get("BOT_STALE_HOURS", "12")) * 3600   # 服务清单多久没更新算「可能过期」
 POLL_EVERY = 8
 RUN_TIMEOUT = 40 * 60       # 单个站点发布最长等多久，超了报「超时」而不是一直挂着
 
@@ -348,6 +349,7 @@ def ensure_admin_build(expect, deadline, on_progress):
                 return False, "触发了 %s 但 Jenkins 没返回队列地址，请去页面确认" % job
             _admin_inflight[exp] = {"queue": queue, "num": None}
             log.info("triggered %s TAG=%s -> %s", job, exp, loc)
+            rlog(event="trigger", site="", job=job, param="TAG", value=exp, queue=queue)
             note = "已触发 %s 打包 `%s`" % (job, exp)
         else:
             queue = (_admin_inflight.get(exp) or {}).get("queue")
@@ -380,7 +382,10 @@ HELP = (
     "2. `@jenkins-bot AR047` 出这个站的发布计划，核对后点 *确认发布*\n"
     "3. 站点分组不明时：`@jenkins-bot AR047 中台`（记住，下次不用再说）\n"
     "4. `@jenkins-bot 当前` 看记着的服务清单\n"
-    "5. `@jenkins-bot 站点` 换行贴这次要发的站点清单（整份发布单也行），之后 `@jenkins-bot 进度` 看哪些站发完了\n"
+    "5. `@jenkins-bot 站点` 换行贴这次要发的站点清单（整份发布单也行）→ 频道里出一条 📋 发版看板，每发完一个站自动更新；"
+    "`@jenkins-bot 进度` 随时看，`@jenkins-bot 看板` 把看板重新发到最下面\n"
+    "6. 服务清单超过 12 小时没更新，出计划时会先提醒、不给确认按钮：重发服务清单，或 `@jenkins-bot 沿用`\n"
+    "7. `@jenkins-bot 记录 AR035` 看这个站机器人发过的记录（谁、什么时候、什么分支、结果）\n"
     "后台：build_admin 同一版本只打一次包，版本已对上就直接发本站后台。\n"
     "发布失败时结论里会附构建日志最后几行，并带 *重发失败的* 按钮。"
 )
@@ -435,7 +440,8 @@ def cmd_services(channel, text, user):
     if groups:
         out.append("站点分组也记住了：" + "、".join("%s=%s" % kv for kv in sorted(groups.items())))
     if sites:
-        out.append("站点清单也记下了：%d 个站，`@jenkins-bot 进度` 可以看发完了哪些" % len(sites))
+        board_async(channel, create=True)
+        out.append("站点清单也记下了：%d 个站。📋 发版看板已发在频道里，每发完一个站自动更新" % len(sites))
     out += ["⚠ " + w for w in warns]
     return "\n".join(out)
 
@@ -453,8 +459,97 @@ def cmd_sites(channel, text, user):
     gs = {}
     for s in sites:
         gs.setdefault(groups.get(s) or "未分组", []).append(s)
-    return "已记下这次发版的 %d 个站点（%s）。`@jenkins-bot 进度` 看哪些发完了。" % (
-        len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items()))
+    board_async(channel, create=True)          # 新一轮发版：频道里发一条看板，之后每发完一个站自动更新
+    return ("已记下这次发版的 %d 个站点（%s）。\n📋 发版看板已发在频道里，每发完一个站自动更新；"
+            "也可以随时 `@jenkins-bot 进度`。" % (len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items())))
+
+
+def cmd_reuse(channel):
+    ch = STATE["channels"].get(channel)
+    if not ch or not ch.get("comps"):
+        return "这个频道还没记服务清单，没什么可沿用的。先 `@jenkins-bot 服务` 贴发布单。"
+    with _state_lock:
+        ch["reuse"] = time.time()
+        save_state(STATE)
+    return ("好，继续沿用 %s 设置的服务清单（%d 小时内不再提醒）。现在可以重新 @我 站点编号出计划：\n" % (
+        fmt_ts(ch["at"]), STALE_SERVICES // 3600) + "\n".join(comp_line(c) for c in ch["comps"]))
+
+
+# ---------------------------------------------------------------- 发版看板：频道里一条消息，每发完一个站自动更新
+_board_lock = threading.Lock()
+
+
+def refresh_board(channel, create=False):
+    """内容就是「进度」。create=True 发一条新的（新一轮发版 / 他要求重发看板），否则原地更新那一条。"""
+    ch = STATE["channels"].get(channel)
+    if not ch or not ch.get("sites") or not ch.get("comps"):
+        return
+    if not create and not ch.get("board"):
+        return                                   # 没开过看板就不自动开，免得频道里冒出意料外的消息
+    try:
+        body = cmd_progress(channel)
+    except Exception as e:
+        log.exception("board progress failed")
+        body = "看板刷新失败：%s: %s" % (type(e).__name__, str(e)[:200])
+    text = "📋 *发版看板*  每发完一个站自动更新 · 最后更新 %s\n\n%s" % (fmt_ts(time.time()), body)
+    with _board_lock:
+        try:
+            if create or not ch.get("board"):
+                r = bolt.client.chat_postMessage(channel=channel, text=text, blocks=_sections(text))
+                with _state_lock:
+                    ch["board"] = {"ts": r["ts"], "at": time.time()}
+                    save_state(STATE)
+            else:
+                bolt.client.chat_update(channel=channel, ts=ch["board"]["ts"], text=text, blocks=_sections(text))
+        except Exception:
+            log.exception("board post/update failed")
+
+
+def board_async(channel, create=False):
+    threading.Thread(target=refresh_board, args=(channel, create), daemon=True).start()
+
+
+# ---------------------------------------------------------------- 发布记录：每次确认/触发/结果都追加一行，永久保留
+RELEASE_LOG = os.path.join(os.path.dirname(STATE_FILE), "releases.jsonl")
+_rlog_lock = threading.Lock()
+
+
+def rlog(**kw):
+    """容器日志满 10MB 就轮转掉了；追查「这个站上次是谁、什么时候、用什么参数发的」要靠这个文件。"""
+    kw = dict(at=time.strftime("%Y-%m-%d %H:%M:%S"), **kw)
+    try:
+        with _rlog_lock, open(RELEASE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(kw, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception("release log write failed")
+
+
+def cmd_history(text):
+    sites = app.parse_sites(text)
+    if not sites:
+        return "格式：`@jenkins-bot 记录 AR035`（看这个站最近的发布记录）"
+    try:
+        with open(RELEASE_LOG, encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f if ln.strip()]
+    except FileNotFoundError:
+        rows = []
+    out = []
+    for s in sites:
+        rs = [r for r in rows if r.get("site") == s and r.get("event") in ("confirm", "result")][-25:]
+        if not rs:
+            out.append("*%s*：机器人还没发过这个站（记录从 10-17 开始）" % s)
+            continue
+        out.append("*%s 最近的发布记录*（机器人发的；手点的不在这里）" % s)
+        lines = []
+        for r in rs:
+            if r["event"] == "confirm":
+                lines.append("%s  %s确认 %d 个 job" % (r["at"][5:16], "重发 " if r.get("retry") else "", len(r.get("jobs", []))))
+            else:
+                lines.append("%s    %s %-16s %-18s #%s %s %s" % (
+                    r["at"][5:16], {"ok": "✅", "bad": "❌", "wrong": "⚠", "skip": "⏭"}.get(r.get("verdict"), "·"),
+                    r.get("view", ""), r.get("branch") or "—", r.get("num") or "—", r.get("result") or "", r.get("sha") or ""))
+        out.append("```" + "\n".join(lines) + "```")
+    return "\n".join(out)
 
 
 def comps_to_text(comps):
@@ -721,8 +816,24 @@ def plan_blocks(p, pid):
                        "text": "计划 15 分钟内有效；只有授权的人点确认才会发布。"}]})
     elif p["targets"]:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
-                       "text": "先把上面的 ❓ 说清楚，我再给你确认按钮。"}]})
+                       "text": "先处理上面的 ❓/⚠，我再给你确认按钮。"}]})
     return blocks
+
+
+def _ago(ts):
+    s = time.time() - ts
+    return "%d 天" % (s // 86400) if s >= 86400 else "%d 小时" % (s // 3600)
+
+
+def running_status(site):
+    """正在发布的站被再次 @ 时：直接给它现在的进度（来自持久化的 running 记录，每次状态变化都会更新）。"""
+    r = (STATE.get("running") or {}).get(site)
+    if not r:
+        return "%s 正在发布中，结束后会在原来的线程里回结论。" % site
+    done = sum(1 for t in r["targets"] if t.get("state") not in ("queued", "running", "wait_admin", "triggering"))
+    return "\n".join(["*%s %s* 正在发布中（%s 确认，已结束 %d/%d），当前进度：" % (
+        site, r.get("disp", ""), fmt_ts(r["started"]), done, len(r["targets"]))] +
+        [_line(t) for t in r["targets"]] + ["_结束后会在原来的线程里回结论，不用再 @。_"])
 
 
 def cmd_plan(channel, text, thread, say):
@@ -737,9 +848,24 @@ def cmd_plan(channel, text, thread, say):
             for s in sites:
                 STATE["site_groups"][s] = g
             save_state(STATE)
-    jobs = jenkins_index(force=True)          # 出计划用最新状态：要据此判断「正在构建」
+    # 服务清单一直沿用最后一次发的，不会自己过期 —— 下次发版忘了重发，就会按上一版的分支发，
+    # 而且一切看起来都正常。超过 STALE_SERVICES 没更新/没确认沿用，就先不给确认按钮。
+    ref = max(ch.get("at", 0), ch.get("reuse", 0))
+    stale = time.time() - ref > STALE_SERVICES
+    jobs = None
     for s in sites:                           # 一个站一条消息、一组按钮，各确认各的
+        if s in RUNNING:                      # 正在发的站：直接给当前进度，不出新计划
+            say(text=running_status(s), thread_ts=thread)
+            continue
+        if jobs is None:
+            jobs = jenkins_index(force=True)  # 出计划用最新状态：要据此判断「正在构建」
         p = build_plan(s, ch["comps"], g, jobs)
+        p["head"] += "\n_服务清单：%s 设置%s_" % (fmt_ts(ch["at"]),
+                                            "，%s 确认沿用" % fmt_ts(ch["reuse"]) if ch.get("reuse") else "")
+        if stale:
+            p["extra"].append("⚠ *服务清单是 %s 设置的（%s前）*，不确定还是不是这次发版的分支。"
+                              "重发 `@jenkins-bot 服务` + 发布单；确定还用这份就回 `@jenkins-bot 沿用`，我再给确认按钮。"
+                              % (fmt_ts(ch["at"]), _ago(ch["at"])))
         pid = uuid.uuid4().hex[:12]
         p.update(at=time.time(), channel=channel, thread=thread)
         with _plans_lock:
@@ -911,6 +1037,8 @@ def run_release(p, user, client, resume=None):
             t.update(state="trigger_err", why=app.friendly_http(e, t["job"]))
         except Exception as e:
             t.update(state="trigger_err", why=str(getattr(e, "reason", e))[:150])
+        rlog(event="trigger", site=site, job=t["job"], param=t["pname"], value=t["value"], user=user,
+             queue=t.get("queue"), error=t.get("why") if t["state"] == "trigger_err" else None)
 
     def admin_flow(admin_ts):
         def prog(msg):
@@ -1050,6 +1178,12 @@ def run_release(p, user, client, resume=None):
                 PLANS[pid] = rp
             blocks += retry_blocks(rp, pid)
         client.chat_postMessage(channel=channel, thread_ts=thread, text=text, blocks=blocks)
+        for t in targets:
+            b = t.get("build") or {}
+            rlog(event="result", site=site, job=t["job"], view="Admin" if t["which"] == ADMIN else t["view"],
+                 num=t.get("num"), result=b.get("result") or t.get("state"), verdict=_verdict(t)[2],
+                 branch=t.get("admin_ver") or b.get("got") or b.get("want"), sha=b.get("sha"), user=user)
+        refresh_board(channel)                   # 看板原地更新（没开过看板就什么都不做）
     except Exception as e:
         log.exception("run_release failed")
         client.chat_postMessage(channel=channel, thread_ts=p.get("thread") or p["ts"],
@@ -1109,6 +1243,8 @@ def on_confirm(ack, body, client):
         except Exception:
             log.exception("retry message failed")
     log.info("confirm %s by %s: %s", p["site"], user, [t["job"] for t in p["targets"]])
+    rlog(event="confirm", site=p["site"], user=user, retry=bool(p.get("summary")),
+         jobs=["%s %s=%s" % (t["job"], t["pname"], t["value"]) if t["pname"] else t["job"] for t in p["targets"]])
     threading.Thread(target=run_release, args=(p, user, client), daemon=True).start()
 
 
@@ -1136,6 +1272,15 @@ def handle(text, channel, user, thread=None, say=None):
         return HELP
     if t.startswith("当前"):
         return cmd_current(channel)
+    if t.startswith("沿用"):
+        return cmd_reuse(channel)
+    if t.startswith("看板"):
+        if not (STATE["channels"].get(channel) or {}).get("sites"):
+            return "还没记这次发版的站点清单。先 `@jenkins-bot 站点` 贴站点清单，我再发看板。"
+        board_async(channel, create=True)
+        return "📋 看板已重新发在频道最下面，之后每发完一个站自动更新这一条。"
+    if t.startswith("记录"):
+        return cmd_history(t)
     if t.startswith("进度"):
         rest = re.sub(r"^进度[:：]?", "", t)
         pre = ""
