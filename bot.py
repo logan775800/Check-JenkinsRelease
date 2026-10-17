@@ -546,7 +546,7 @@ def _verdict(t):
         # 比 Git 实际拉到的（got），不比参数（want）—— 参数是我们自己传的，比它永远相等，等于没核对
         got, want = b.get("got"), b.get("want")
         if got and not app.ref_matches(got, t["value"]):
-            return "⚠", "发错：传的 `%s`，Git 实际拉到 `%s`" % (want or t["value"], got), "wrong"
+            return "⚠", "发错：应为 `%s`，Git 实际拉到 `%s`" % (t["value"], got), "wrong"
         if not got and want and not app.ref_matches(want, t["value"]):
             return "⚠", "发错：实际参数 `%s`，应为 `%s`" % (want, t["value"]), "wrong"
     if t.get("admin_note"):
@@ -569,85 +569,167 @@ def _line(t):
     return "%s *%s* `%s` %s %s%s" % (ico, t["view"], t["job"], num, txt, dur)
 
 
-def run_release(p, user, client):
+def _persist(p, user, started, targets):
+    """正在发布的站点写进状态文件：①部署前据此判断能不能重启 ②重启后据此接着跟踪。"""
+    with _state_lock:
+        STATE.setdefault("running", {})[p["site"]] = {
+            "site": p["site"], "disp": p.get("disp", ""), "channel": p["channel"], "ts": p["ts"],
+            "thread": p.get("thread"), "user": user, "started": started, "targets": targets}
+        save_state(STATE)
+
+
+def _unpersist(site):
+    with _state_lock:
+        if STATE.get("running", {}).pop(site, None) is not None:
+            save_state(STATE)
+
+
+def _build_after(t, since):
+    """这个 job 在 since 之后开始的最近一次构建号（重启后找回「已触发但没记下构建号」的那次）。"""
+    try:
+        lb = jget(t["which"], "/job/%s/api/json" % q(t["job"]) + app._q("lastBuild[number,timestamp,url]"))
+        b = lb.get("lastBuild") or {}
+        if (b.get("timestamp") or 0) / 1000.0 >= since - 5:
+            return b.get("number"), b.get("url", "")
+    except Exception as e:
+        log.warning("build_after %s: %s", t["job"], e)
+    return None, ""
+
+
+def _end_ts(t):
+    b = t.get("build") or {}
+    return (b.get("ts") or 0) + (b.get("dur") or 0)
+
+
+def summary_text(site, disp, targets, user, started):
+    """发完后的结论：像 release 机器人那样一张表列出本次每个服务的实际分支，问题项再单独列链接。"""
+    cats = {}
+    for t in targets:
+        cats.setdefault(_verdict(t)[2], []).append(t)
+    n_ok, n_bad, n_wrong, n_skip = (len(cats.get(k, [])) for k in ("ok", "bad", "wrong", "skip"))
+    if n_ok == len(targets):
+        title = "✅ *%s %s 全部发布成功 %d/%d*，分支已逐个核对" % (site, disp, n_ok, len(targets))
+    else:
+        title = "*%s %s 发布结果*：✅ 成功 %d　❌ 失败 %d　⚠ 发错 %d　⏭ 跳过 %d" % (
+            site, disp, n_ok, n_bad, n_wrong, n_skip)
+    rows = []
+    for t in targets:
+        ico, _, _ = _verdict(t)
+        b = t.get("build") or {}
+        # 表里写 Git 实际拉到的分支（核对用的就是它）；后台部署 job 自己不拉代码，写它装的包版本
+        br = t.get("admin_ver") or b.get("got") or b.get("want") or t.get("value") or "—"
+        name = "Admin" if t["which"] == ADMIN else t["view"]
+        if len([x for x in targets if x["view"] == t["view"]]) > 1:   # 一站多 job（AR013 的两个 Pages）
+            name += "(" + t["job"].split("-")[-1] + ")"
+        rows.append("%s %-16s %-20s %-6s %-12s %s" % (
+            ico, name, br, ("#%s" % t["num"]) if t.get("num") else "—",
+            fmt_ts(_end_ts(t)) if t.get("build") else "—", b.get("sha") or ""))
+    lines = [title, "```" + "\n".join(rows) + "```"]
+    for k in ("bad", "wrong", "skip"):
+        lines += [_line(t) for t in cats.get(k, [])]
+    lines.append("<@%s> 用时 %d 分钟（%s 起）。可以接着 @我 下一个站。" % (
+        user, (time.time() - started) // 60, fmt_ts(started)))
+    return "\n".join(lines)
+
+
+def run_release(p, user, client, resume=None):
+    """resume 不为空 = 机器人重启后接着跟踪（resume 是持久化的那份记录）。"""
     site, channel = p["site"], p["channel"]
-    targets = [dict(t) for t in p["targets"]]
-    started = time.time()
+    if resume:
+        targets, started = resume["targets"], resume["started"]
+    else:
+        targets, started = [dict(t) for t in p["targets"]], time.time()
 
     def render(final=False):
         head = "*%s %s* %s（<@%s> %s 确认）" % (site, p.get("disp", ""), "发布结束" if final else "发布中",
                                             user, fmt_ts(started))
         body = "\n".join([head] + [_line(t) for t in targets])
+        if not final:
+            _persist(p, user, started, targets)
         try:
             client.chat_update(channel=channel, ts=p["ts"], text=body, blocks=_sections(body))
         except Exception:
             log.exception("chat_update failed")
 
-    try:
-        # 1. 触发前再看一眼：正在构建的不重复触发
-        jobs = jenkins_index(force=True)
-        for t in targets:
-            if t["which"] == AR and (jobs.get(t["job"]) or {}).get("building"):
-                t.update(state="skip", why="触发前发现它正在构建，没重复触发")
-                continue
-            if t["which"] == ADMIN:
-                try:
-                    lb = jget(ADMIN, "/job/%s/api/json" % q(t["job"]) + app._q("lastBuild[number,building]"))
-                    if (lb.get("lastBuild") or {}).get("building"):
-                        t.update(state="skip", why="触发前发现它正在构建，没重复触发")
-                        continue
-                except Exception:
-                    pass
-            # 后台部署要等 build_admin 有这个版本的包，先挂起，由下面的 admin_flow 放行
-            t["state"] = "wait_admin" if t.get("admin_ver") else "triggering"
-        render()
+    def trigger(t):
+        path = "/job/%s/" % q(t["job"])
+        path += ("buildWithParameters?%s=%s" % (t["pname"], q(t["value"]))) if t["pname"] else "build"
+        try:
+            loc = jpost(t["which"], path)
+            t.update(state="queued", queue=urllib.parse.urlparse(loc).path if loc else "")
+            log.info("triggered %s %s=%s -> %s", t["job"], t["pname"], t["value"], loc)
+        except urllib.error.HTTPError as e:
+            t.update(state="trigger_err", why=app.friendly_http(e, t["job"]))
+        except Exception as e:
+            t.update(state="trigger_err", why=str(getattr(e, "reason", e))[:150])
 
-        def trigger(t):
-            path = "/job/%s/" % q(t["job"])
-            path += ("buildWithParameters?%s=%s" % (t["pname"], q(t["value"]))) if t["pname"] else "build"
-            try:
-                loc = jpost(t["which"], path)
-                t.update(state="queued", queue=urllib.parse.urlparse(loc).path if loc else "")
-                log.info("triggered %s %s=%s -> %s", t["job"], t["pname"], t["value"], loc)
-            except urllib.error.HTTPError as e:
-                t.update(state="trigger_err", why=app.friendly_http(e, t["job"]))
-            except Exception as e:
-                t.update(state="trigger_err", why=str(getattr(e, "reason", e))[:150])
-
-        # 2a. 后台：确保 build_admin 有这个版本（同版本全局只打一次），之后再发本站后台。
-        # 单独线程跑，不挡其它服务。
-        admin_ts = [t for t in targets if t["state"] == "wait_admin"]
-
-        def admin_flow():
-            def prog(msg):
-                for t in admin_ts:
-                    if t["state"] == "wait_admin":
-                        t["why"] = msg
-            try:
-                ok, note = ensure_admin_build(admin_ts[0]["admin_ver"], started + RUN_TIMEOUT, prog)
-            except Exception as e:
-                log.exception("admin build failed")
-                ok, note = False, "%s 出错：%s" % (app.ADMIN_BUILD_JOB, str(getattr(e, "reason", e))[:150])
+    def admin_flow(admin_ts):
+        def prog(msg):
             for t in admin_ts:
-                if t["state"] != "wait_admin":
-                    continue
-                if ok:
-                    t["admin_note"] = note
-                    trigger(t)
-                else:
-                    t.update(state="admin_err", why=note)
-
-        if admin_ts:
-            threading.Thread(target=admin_flow, daemon=True).start()
-        # 2b. 其它服务逐个触发（间隔 1 秒，别一瞬间打满 WAF）
-        for t in targets:
-            if t["state"] == "triggering":
+                if t["state"] == "wait_admin":
+                    t["why"] = msg
+        try:
+            ok, note = ensure_admin_build(admin_ts[0]["admin_ver"], started + RUN_TIMEOUT, prog)
+        except Exception as e:
+            log.exception("admin build failed")
+            ok, note = False, "%s 出错：%s" % (app.ADMIN_BUILD_JOB, str(getattr(e, "reason", e))[:150])
+        for t in admin_ts:
+            if t["state"] != "wait_admin":
+                continue
+            if ok:
+                t["admin_note"] = note
                 trigger(t)
-                time.sleep(1)
-        render()
+            else:
+                t.update(state="admin_err", why=note)
+
+    try:
+        if resume:
+            # 重启前没走完的：已触发但没拿到构建号的，按「确认之后开始的那次构建」找回来；
+            # 找不到就如实说没触发，绝不补触发（不确定的时候重复发版比漏发更糟）
+            log.info("resume %s", site)
+            for t in targets:
+                if t["state"] in ("triggering", "queued"):
+                    num, url = _build_after(t, started)
+                    if num:
+                        t.update(state="running", num=num, url=url)
+                    elif t["state"] == "triggering":
+                        t.update(state="trigger_err", why="机器人重启时它还没触发，没有补发，需要的话重新 @我")
+            admin_ts = [t for t in targets if t["state"] == "wait_admin"]
+            if admin_ts:
+                threading.Thread(target=admin_flow, args=(admin_ts,), daemon=True).start()
+            render()
+        else:
+            # 1. 触发前再看一眼：正在构建的不重复触发
+            jobs = jenkins_index(force=True)
+            for t in targets:
+                if t["which"] == AR and (jobs.get(t["job"]) or {}).get("building"):
+                    t.update(state="skip", why="触发前发现它正在构建，没重复触发")
+                    continue
+                if t["which"] == ADMIN:
+                    try:
+                        lb = jget(ADMIN, "/job/%s/api/json" % q(t["job"]) + app._q("lastBuild[number,building]"))
+                        if (lb.get("lastBuild") or {}).get("building"):
+                            t.update(state="skip", why="触发前发现它正在构建，没重复触发")
+                            continue
+                    except Exception:
+                        pass
+                # 后台部署要等 build_admin 有这个版本的包，先挂起，由 admin_flow 放行
+                t["state"] = "wait_admin" if t.get("admin_ver") else "triggering"
+            render()
+            # 2a. 后台：确保 build_admin 有这个版本（同版本全局只打一次），单独线程跑，不挡其它服务
+            admin_ts = [t for t in targets if t["state"] == "wait_admin"]
+            if admin_ts:
+                threading.Thread(target=admin_flow, args=(admin_ts,), daemon=True).start()
+            # 2b. 其它服务逐个触发（间隔 1 秒，别一瞬间打满 WAF）
+            for t in targets:
+                if t["state"] == "triggering":
+                    trigger(t)
+                    render()          # 每触发一个就落盘：此刻重启也知道哪些已经发出去了
+                    time.sleep(1)
         # 3. 跟踪：队列 -> 拿到构建号 -> 等构建结束
         snap = lambda: [(t["state"], t.get("num"), t.get("why")) for t in targets]
         last = snap()
+        q404 = {}
         while any(t["state"] in ("queued", "running", "wait_admin", "triggering") for t in targets):
             if time.time() - started > RUN_TIMEOUT:
                 for t in targets:
@@ -655,60 +737,69 @@ def run_release(p, user, client):
                         t["state"] = "timeout"
                 break
             time.sleep(POLL_EVERY)
-            changed = snap() != last          # 后台线程也会改状态，按快照比
             for t in targets:
                 try:
                     if t["state"] == "queued":
                         if not t.get("queue"):
-                            t.update(state="trigger_err", why="Jenkins 没返回队列地址，无法跟踪，请去页面看")
-                            changed = True
+                            num, url = _build_after(t, started)
+                            if num:
+                                t.update(state="running", num=num, url=url)
                             continue
                         qi = jget(t["which"], t["queue"].rstrip("/") + "/api/json" +
                                   app._q("cancelled,executable[number,url]"))
                         if qi.get("cancelled"):
                             t["state"] = "cancelled"
-                            changed = True
                         elif qi.get("executable"):
                             t.update(state="running", num=qi["executable"]["number"],
                                      url=qi["executable"].get("url", ""))
-                            changed = True
                     if t["state"] == "running":
                         b = jget(t["which"], "/job/%s/%s/api/json" % (q(t["job"]), t["num"]) + app._q(
                             "number,result,building,timestamp,duration,url,actions[parameters[name,value],"
                             "lastBuiltRevision[SHA1,branch[name]],causes[userName,shortDescription]]"))
                         if not b.get("building") and b.get("result"):
                             t.update(state="done", build=app.read_build(b))
-                            changed = True
                 except urllib.error.HTTPError as e:
                     if e.code == 404 and t["state"] == "queued":
-                        continue        # 队列项刚被 Jenkins 回收、构建号还没写回，下一轮再看
+                        # 队列项刚被回收、构建号还没写回；连着几轮都 404 就按开始时间去 job 上找
+                        q404[t["job"]] = q404.get(t["job"], 0) + 1
+                        if q404[t["job"]] >= 3:
+                            num, url = _build_after(t, started)
+                            if num:
+                                t.update(state="running", num=num, url=url)
+                        continue
                     log.warning("poll %s: %s", t["job"], e)
                 except Exception as e:
                     log.warning("poll %s: %s", t["job"], e)
-            if changed or snap() != last:
+            if snap() != last:                # 后台线程也会改状态，按快照比
                 render()
                 last = snap()
         render(final=True)
         # 4. 结论单独发一条，@ 确认人，方便手机上看到推送
-        cats = {}
-        for t in targets:
-            cats.setdefault(_verdict(t)[2], []).append(t)
-        n_ok, n_bad, n_wrong, n_skip = (len(cats.get(k, [])) for k in ("ok", "bad", "wrong", "skip"))
-        title = ("✅ *%s 全部发布成功* %d/%d" % (site, n_ok, len(targets)) if n_ok == len(targets)
-                 else "*%s 发布结果*：✅ 成功 %d　❌ 失败 %d　⚠ 发错 %d　⏭ 跳过 %d" % (site, n_ok, n_bad, n_wrong, n_skip))
-        lines = [title]
-        for k in ("bad", "wrong", "skip"):
-            lines += ["　" + _line(t) for t in cats.get(k, [])]
-        lines.append("<@%s> 用时 %d 分钟。可以接着 @我 下一个站。" % (user, (time.time() - started) // 60))
-        client.chat_postMessage(channel=channel, thread_ts=p.get("thread") or p["ts"], text="\n".join(lines))
+        client.chat_postMessage(channel=channel, thread_ts=p.get("thread") or p["ts"],
+                                text=summary_text(site, p.get("disp", ""), targets, user, started))
     except Exception as e:
         log.exception("run_release failed")
         client.chat_postMessage(channel=channel, thread_ts=p.get("thread") or p["ts"],
                                 text="❗ %s 发布过程出错，已停止跟踪（已触发的 job 仍在 Jenkins 上跑）：%s: %s"
                                      % (site, type(e).__name__, str(e)[:300]))
     finally:
+        _unpersist(site)
         with _plans_lock:
             RUNNING.discard(site)
+
+
+def resume_all(client):
+    """机器人启动时接着跟踪重启前没发完的站点。"""
+    for site, r in list((STATE.get("running") or {}).items()):
+        p = {"site": site, "disp": r.get("disp", ""), "channel": r["channel"], "ts": r["ts"], "thread": r.get("thread")}
+        with _plans_lock:
+            RUNNING.add(site)
+        try:
+            client.chat_postMessage(channel=r["channel"], thread_ts=r.get("thread") or r["ts"],
+                                    text="ℹ 机器人刚重启过，接着跟踪 %s 的发布结果。" % site)
+        except Exception:
+            log.exception("resume notice failed")
+        threading.Thread(target=run_release, args=(p, r["user"], client, r), daemon=True).start()
 
 
 @bolt.action("confirm")
@@ -794,4 +885,5 @@ if __name__ == "__main__":
         raise SystemExit("缺 JENKINS_URL / JENKINS_USER / JENKINS_API_TOKEN")
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     log.info("jenkins-bot starting, state=%s, allowed=%s", STATE_FILE, sorted(ALLOWED))
+    resume_all(bolt.client)
     SocketModeHandler(bolt, os.environ["SLACK_APP_TOKEN"]).start()

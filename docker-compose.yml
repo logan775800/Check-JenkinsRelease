@@ -58,7 +58,9 @@ services:
       - path: /data/release-bot/.env
         required: false
     environment:
-      TZ: "${TZ:-UTC}"
+      # 机器人消息里的时间按看消息的人的时区显示（Logan 的 Slack 是 UTC+4），
+      # 和群里 release 机器人一致；网页版仍用 .env 里的 TZ。
+      TZ: "${BOT_TZ:-Asia/Dubai}"
       BOT_STATE: /state/state.json
     volumes:
       - /data/release-bot/state:/state
