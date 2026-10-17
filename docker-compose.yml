@@ -42,3 +42,28 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Slack 机器人（Socket Mode，主动连 Slack，不开端口）。
+  # Slack token 放在仓库外的 /data/release-bot/.env；没有这个文件时本服务起不来，
+  # 但不影响上面的网页版（required: false 只是让 compose 不因缺文件整体报错）。
+  jenkins-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    image: jenkins-bot:latest
+    container_name: jenkins-bot
+    restart: always
+    env_file:
+      - .env
+      - path: /data/release-bot/.env
+        required: false
+    environment:
+      TZ: "${TZ:-UTC}"
+      BOT_STATE: /state/state.json
+    volumes:
+      - /data/release-bot/state:/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

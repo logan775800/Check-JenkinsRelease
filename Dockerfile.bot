@@ -1,0 +1,10 @@
+# jenkins-bot：Slack 发版机器人。和网页版共用 app.py（解析 + Jenkins 访问），
+# 单独一个镜像是因为它要 slack_bolt，而网页版坚持零第三方依赖。
+FROM python:3.12-alpine
+RUN apk add --no-cache tzdata && pip install --no-cache-dir "slack_bolt>=1.18,<2"
+WORKDIR /app
+COPY app.py bot.py /app/
+RUN adduser -D -H -u 10001 appuser
+USER appuser
+ENV TZ=UTC PYTHONUNBUFFERED=1
+CMD ["python", "/app/bot.py"]
