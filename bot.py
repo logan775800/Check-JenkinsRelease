@@ -454,6 +454,23 @@ def cmd_sites(channel, text, user):
         len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items()))
 
 
+def comps_to_text(comps):
+    """已识别的服务清单 -> 发布单格式的服务行（parse_components 能原样认回来）。
+    用发布单原写法 raw 而不是组件名：组件 Web(代理后台) 的名字按别名会被认成 Pages。"""
+    by = {}
+    for c in comps:
+        by.setdefault(c["raw"], []).append(c)
+    out = []
+    for raw, cs in by.items():
+        if len(cs) == 1 and not cs[0]["group"] and not cs[0]["site"]:
+            out.append("%s → 分支：%s" % (raw, cs[0]["expect"]))
+        else:
+            out.append("%s → 分支：%s" % (raw, " ／ ".join(
+                "%s %s" % (c["group"] or c["site"].lower(), c["expect"]) if (c["group"] or c["site"]) else c["expect"]
+                for c in cs)))
+    return "\n".join(out)
+
+
 def cmd_progress(channel):
     """
     这次发版的站点进度：哪些站全部发完、哪些有问题、哪些发了一部分、哪些还没开始。
@@ -465,9 +482,9 @@ def cmd_progress(channel):
     if not ch.get("sites"):
         return ("我不知道这次要发哪些站。发 `@jenkins-bot 站点` 换行贴站点清单（或者把整份发布单贴进 `@jenkins-bot 服务`），"
                 "我才能算出还有哪些没发。")
-    text = ch.get("text", "")
-    if ch.get("sites_text") and ch["sites_text"] != text:
-        text = ch["sites_text"] + "\n" + text          # 站点清单在前：分组标题要先于站点行出现
+    # 不用存下来的原文，用已识别的服务清单重拼：10-17 早上记的清单是旧版存的、没有原文，
+    # 「进度」直接报「没解析出组件行」。站点清单在前：分组标题要先于站点行出现
+    text = (ch.get("sites_text") or "") + "\n" + comps_to_text(ch["comps"])
     d0 = datetime.fromtimestamp(ch["at"]).date()
     days = (datetime.now().date() - d0).days + 1
     r = app.run_check(text, d0.strftime("%Y-%m-%d"), days, ["AR000"], False, True, J_USER, J_TOKEN)
@@ -1052,7 +1069,13 @@ def handle(text, channel, user, thread=None, say=None):
     if t.startswith("当前"):
         return cmd_current(channel)
     if t.startswith("进度"):
-        return cmd_progress(channel)
+        rest = re.sub(r"^进度[:：]?", "", t)
+        pre = ""
+        if app.parse_components(rest)[0]:          # 「进度」后面顺手贴了服务清单 → 先更新清单再算
+            pre = cmd_services(channel, rest, user).split("\n")[0] + "\n\n"
+        elif app.parse_sites(rest):                # 后面贴的是站点清单 → 先记站点再算
+            pre = cmd_sites(channel, rest, user) + "\n\n"
+        return pre + cmd_progress(channel)
     if t.startswith("站点"):
         return cmd_sites(channel, re.sub(r"^站点(清单)?[:：]?", "", t), user)
     if t.startswith("服务") or app.parse_components(t)[0]:
