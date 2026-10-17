@@ -399,7 +399,7 @@ HELP = """*jenkins-bot 指令大全*  （频道里 @jenkins-bot 加下面的指�
 
 *三、特殊情况*
 • 站点分组不明时会问你：`@jenkins-bot AR047 中台` / `@jenkins-bot AR047 非中台` （记住，下次不用再说）
-• 服务清单超过 12 小时没更新：计划先不给确认按钮，重发 `服务` ，或回 `@jenkins-bot 沿用` 继续用这份
+• 服务清单超过 12 小时没更新：计划先不给确认按钮，重发 `@jenkins-bot 服务` 后再出计划
 • 站点正在发布中再 @ 它：直接回当前进度，不会重复发
 • 构建失败：线程里附报错行，结论下面有 *重发失败的 N 个* / *不重发* 按钮（15 分钟内有效）
 
@@ -483,17 +483,6 @@ def cmd_sites(channel, text, user):
     board_async(channel, create=True)          # 新一轮发版：频道里发一条看板，之后每发完一个站自动更新
     return ("已记下这次发版的 %d 个站点（%s）。\n📋 发版看板已发在频道里，每发完一个站自动更新；"
             "也可以随时 `@jenkins-bot 进度`。" % (len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items())))
-
-
-def cmd_reuse(channel):
-    ch = STATE["channels"].get(channel)
-    if not ch or not ch.get("comps"):
-        return "这个频道还没记服务清单，没什么可沿用的。先 `@jenkins-bot 服务` 贴发布单。"
-    with _state_lock:
-        ch["reuse"] = time.time()
-        save_state(STATE)
-    return ("好，继续沿用 %s 设置的服务清单（%d 小时内不再提醒）。现在可以重新 @我 站点编号出计划：\n" % (
-        fmt_ts(ch["at"]), STALE_SERVICES // 3600) + "\n".join(comp_line(c) for c in ch["comps"]))
 
 
 # ---------------------------------------------------------------- 发版看板：频道里一条消息，每发完一个站自动更新
@@ -869,10 +858,10 @@ def cmd_plan(channel, text, thread, say):
             for s in sites:
                 STATE["site_groups"][s] = g
             save_state(STATE)
-    # 服务清单一直沿用最后一次发的，不会自己过期 —— 下次发版忘了重发，就会按上一版的分支发，
-    # 而且一切看起来都正常。超过 STALE_SERVICES 没更新/没确认沿用，就先不给确认按钮。
-    ref = max(ch.get("at", 0), ch.get("reuse", 0))
-    stale = time.time() - ref > STALE_SERVICES
+    # 服务清单一直用最后一次发的，不会自己过期 —— 下次发版忘了重发，就会按上一版的分支发，
+    # 而且一切看起来都正常。超过 STALE_SERVICES 没更新就先不给确认按钮，必须重发清单
+    # （10-17 他把「沿用」去掉了：每次发版都重发清单）。
+    stale = time.time() - ch.get("at", 0) > STALE_SERVICES
     jobs = None
     for s in sites:                           # 一个站一条消息、一组按钮，各确认各的
         if s in RUNNING:                      # 正在发的站：直接给当前进度，不出新计划
@@ -881,11 +870,10 @@ def cmd_plan(channel, text, thread, say):
         if jobs is None:
             jobs = jenkins_index(force=True)  # 出计划用最新状态：要据此判断「正在构建」
         p = build_plan(s, ch["comps"], g, jobs)
-        p["head"] += "\n_服务清单：%s 设置%s_" % (fmt_ts(ch["at"]),
-                                            "，%s 确认沿用" % fmt_ts(ch["reuse"]) if ch.get("reuse") else "")
+        p["head"] += "\n_服务清单：%s 设置_" % fmt_ts(ch["at"])
         if stale:
             p["extra"].append("⚠ *服务清单是 %s 设置的（%s前）*，不确定还是不是这次发版的分支。"
-                              "重发 `@jenkins-bot 服务` + 发布单；确定还用这份就回 `@jenkins-bot 沿用`，我再给确认按钮。"
+                              "请重发 `@jenkins-bot 服务` + 发布单，再 @我 站点编号，我再给确认按钮。"
                               % (fmt_ts(ch["at"]), _ago(ch["at"])))
         pid = uuid.uuid4().hex[:12]
         p.update(at=time.time(), channel=channel, thread=thread)
@@ -1293,8 +1281,6 @@ def handle(text, channel, user, thread=None, say=None):
         return HELP
     if t.startswith("当前"):
         return cmd_current(channel)
-    if t.startswith("沿用"):
-        return cmd_reuse(channel)
     if t.startswith("看板"):
         if not (STATE["channels"].get(channel) or {}).get("sites"):
             return "还没记这次发版的站点清单。先 `@jenkins-bot 站点` 贴站点清单，我再发看板。"
