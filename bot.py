@@ -378,7 +378,7 @@ def fmt_ts(ts):
 def comp_line(c):
     view = app.COMPONENT_VIEW.get(c["name"], app.ADMIN_VIEW if c["name"] == app.ADMIN_COMP else c["name"])
     scope = ("（%s）" % c["group"]) if c["group"] else (("（仅 %s）" % c["site"]) if c["site"] else "")
-    return "• *%s*%s → `%s`　_发布单写的「%s」_" % (view, scope, c["expect"], c["raw"])
+    return "• *%s* %s → `%s`　_发布单写的「%s」_" % (view, scope, c["expect"], c["raw"])
 
 
 # ---------------------------------------------------------------- 命令：服务 / 当前
@@ -469,7 +469,7 @@ def cmd_progress(channel):
     part = [kv for kv in S if not kv[1]["bad"] and kv[1]["ok"] < kv[1]["n"] and (kv[1]["ok"] or kv[1]["run"])]
     none = [kv for kv in S if not kv[1]["bad"] and not kv[1]["ok"] and not kv[1]["run"]]
     nm = lambda k, s: "%s %s" % (k, s["name"]) if s["name"] else k
-    out = ["*发版进度：全部发完 %d / %d 站*（时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days)]
+    out = ["*发版进度：全部发完 %d / %d 站*  （时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days)]
     if done:                                  # 他要的：全部发完的放最前，最近发完的在前
         out.append("\n✅ *全部发完（%d）*" % len(done))
         out.append("　" + "　".join("%s(%s)" % (k, fmt_ts(s["last"])[6:]) for k, s in done))
@@ -493,7 +493,7 @@ def cmd_current(channel):
     ch = STATE["channels"].get(channel)
     if not ch:
         return "这个频道还没记服务清单。先 `@jenkins-bot 服务` 贴发布单。"
-    return ("当前服务清单（%s 由 <@%s> 设置）：\n" % (fmt_ts(ch["at"]), ch["by"]) +
+    return ("当前服务清单（%s 设置）：\n" % fmt_ts(ch["at"]) +
             "\n".join(comp_line(c) for c in ch["comps"]))
 
 
@@ -502,7 +502,7 @@ def build_plan(site, comps, group_hint, jobs):
     """返回 dict：head / lines（展示）/ targets（确认后要触发的）/ extra（提示）。"""
     site_jobs = {n: j for n, j in jobs.items() if j["site"] == site}
     if not site_jobs:
-        return {"site": site, "head": "*%s*：Jenkins 上没有这个站点的任何 job，编号写错了？" % site,
+        return {"site": site, "head": "*%s*  Jenkins 上没有这个站点的任何 job，编号写错了？" % site,
                 "lines": [], "targets": [], "extra": []}
     disp = ""
     for n in sorted(site_jobs):
@@ -554,7 +554,7 @@ def build_plan(site, comps, group_hint, jobs):
                 continue
             flags = [note] if note else []
             if branch_switch(j["last"], val):
-                flags.append("↔ *换分支*：上次 `%s`，本次 `%s`" % (app.normalize_ref(j["last"]), val))
+                flags.append("↔ *换分支*  上次 `%s`，本次 `%s`" % (app.normalize_ref(j["last"]), val))
             elif j["last"] and app.ref_matches(j["last"], val):
                 flags.append("上次 #%s（%s）发的也是它" % (j["num"], fmt_ts(j["ts"])))
             if j["building"]:
@@ -742,9 +742,10 @@ def summary_text(site, disp, targets, user, started):
         cats.setdefault(_verdict(t)[2], []).append(t)
     n_ok, n_bad, n_wrong, n_skip = (len(cats.get(k, [])) for k in ("ok", "bad", "wrong", "skip"))
     if n_ok == len(targets):
-        title = "✅ *%s %s 全部发布成功 %d/%d*，分支已逐个核对" % (site, disp, n_ok, len(targets))
+        # 注意：Slack 粗体的右 * 后面必须是空格/行尾，紧跟中文标点（，：（）就不认，会原样显示星号
+        title = "✅ *%s %s 全部发布成功 %d/%d*  分支已逐个核对" % (site, disp, n_ok, len(targets))
     else:
-        title = "*%s %s 发布结果*：✅ 成功 %d　❌ 失败 %d　⚠ 发错 %d　⏭ 跳过 %d" % (
+        title = "*%s %s 发布结果*  ✅ 成功 %d　❌ 失败 %d　⚠ 发错 %d　⏭ 跳过 %d" % (
             site, disp, n_ok, n_bad, n_wrong, n_skip)
     rows = []
     for t in targets:
@@ -761,8 +762,8 @@ def summary_text(site, disp, targets, user, started):
     lines = [title, "```" + "\n".join(rows) + "```"]
     for k in ("bad", "wrong", "skip"):
         lines += [_line(t) for t in cats.get(k, [])]
-    lines.append("<@%s> 用时 %d 分钟（%s 起）。可以接着 @我 下一个站。" % (
-        user, (time.time() - started) // 60, fmt_ts(started)))
+    lines.append("用时 %d 分钟（%s 起）。可以接着 @我 下一个站。" % (
+(time.time() - started) // 60, fmt_ts(started)))
     return "\n".join(lines)
 
 
@@ -775,8 +776,8 @@ def run_release(p, user, client, resume=None):
         targets, started = [dict(t) for t in p["targets"]], time.time()
 
     def render(final=False):
-        head = "*%s %s* %s（<@%s> %s 确认）" % (site, p.get("disp", ""), "发布结束" if final else "发布中",
-                                            user, fmt_ts(started))
+        head = "*%s %s* %s（%s 确认）" % (site, p.get("disp", ""), "发布结束" if final else "发布中",
+                                       fmt_ts(started))
         body = "\n".join([head] + [_line(t) for t in targets])
         if not final:
             _persist(p, user, started, targets)
@@ -988,7 +989,7 @@ def on_confirm(ack, body, client):
         try:
             client.chat_update(channel=ch, ts=p["ts"], text=p["summary"],
                                blocks=_sections(p["summary"]) + [{"type": "context", "elements": [
-                                   {"type": "mrkdwn", "text": "<@%s> 已点重发" % user}]}])
+                                   {"type": "mrkdwn", "text": "已点重发"}]}])
             r = client.chat_postMessage(channel=ch, thread_ts=p["thread"], text=p["head"] + " 开始…")
             p["ts"] = r["ts"]
         except Exception:
@@ -1006,7 +1007,7 @@ def on_cancel(ack, body, client):
     if p and p.get("summary"):        # 「不重发」：保留结论，只去掉按钮
         client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=p["summary"],
                            blocks=_sections(p["summary"]) + [{"type": "context", "elements": [
-                               {"type": "mrkdwn", "text": "<@%s> 选了不重发" % body["user"]["id"]}]}])
+                               {"type": "mrkdwn", "text": "已选不重发"}]}])
         return
     txt = "已取消%s，没有触发任何构建。" % ((" " + p["site"]) if p else "")
     client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=txt,
