@@ -571,6 +571,20 @@ for title, want in (("中台站", "中台"), ("非中台站（1个）", "非中�
                     ("非中台版本分支", "非中台"), ("中台站(8个)", "中台")):
     check(f"分组标题「{title}」归一成「{want}」", app.canon_group(title) == want, app.canon_group(title))
 
+# 10-17：中台标题后面跟着分支说明，整行超长没被认成标题，34 个中台站全被归进「非中台」
+G1017 = """非中台站（11个）
+\t\t\t\t(马来) AR046→MZ
+\t\t\t\t(印尼) AR045→55
+
+中台站（34个）      feature/v3-uat   master_V3.11_015
+\t\t\t\t(印度) AR002→pop678
+\t\t\t\t(印度) AR108→khelv
+"""
+g = app.parse_groups(G1017)
+check("标题带说明也能认出分组", g == {"AR046": "非中台", "AR045": "非中台", "AR002": "中台", "AR108": "中台"}, g)
+g = app.parse_groups("中台站点\n（印度）AR001→a\n注意：以下几个站点今晚十点以后再发  不要提前发\n（印度）AR002→b\n")
+check("普通长说明行不被当成分组", g == {"AR001": "中台", "AR002": "中台"}, g)
+
 check("简写 v3-uat 对上 feature/v3-uat", app.ref_matches("refs/remotes/origin/feature/v3-uat", "v3-uat"))
 check("简写 main-3.04 对上 masterBranch/main-3.04", app.ref_matches("origin/masterBranch/main-3.04", "main-3.04"))
 check("uat 不能对上 feature/v3-uat", not app.ref_matches("feature/v3-uat", "uat"))

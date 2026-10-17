@@ -537,6 +537,15 @@ def parse_groups(text):
         if (len(s) <= 16 and not s.startswith("【") and not re.match(r"^\d+\s*[.、]", s)
                 and not re.search(r"(?i)(→|->|=>|➔|⇒|tag|分支|branch|标签)", s)):
             cur = canon_group(s)
+            continue
+        # 标题后面跟着说明的：「中台站（34个）      feature/v3-uat   master_V3.11_015」。
+        # 整行超长被上面跳过，34 个中台站全被归进上一个「非中台」组（10-17 实际发生，
+        # 机器人差点给中台站发 uat）。只认第一段，且第一段必须像分组名（含「中台」或以 站/站点 结尾），
+        # 免得随便一行长说明的第一个词被当成分组。
+        head = re.split(r"\s{2,}|\t", s)[0]
+        if (head != s and len(head) <= 16 and not re.search(r"(?i)(→|->|=>|➔|⇒)", head)
+                and re.search(r"中台|站点?(（[^）]*）|\([^)]*\))?$", head)):
+            cur = canon_group(head)
     return groups
 
 
