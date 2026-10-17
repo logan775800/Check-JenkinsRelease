@@ -427,7 +427,10 @@ def cmd_services(channel, text, user):
         STATE["channels"][channel] = ch
         STATE["site_groups"].update(groups)
         save_state(STATE)
-    out = ["已记下 %d 个服务（之后 @我 站点编号就按这份出计划）：" % len(comps)]
+    n_raw = len({c["raw"] for c in comps})
+    split = [c["raw"] for c in comps if c["group"] or c["site"]]
+    out = ["已记下 %d 个服务%s（之后 @我 站点编号就按这份出计划）：" % (
+        n_raw, ("，其中 %s 按分组拆成 %d 条" % ("、".join(sorted(set(split))), len(split))) if split else "")]
     out += [comp_line(c) for c in comps]
     if groups:
         out.append("站点分组也记住了：" + "、".join("%s=%s" % kv for kv in sorted(groups.items())))
@@ -471,6 +474,65 @@ def comps_to_text(comps):
     return "\n".join(out)
 
 
+def _pad(s, n):
+    """按显示宽度补空格：等宽代码块里中文占 2 格，用 %-17s 会把「Web-Pages 非中台」那行挤歪。"""
+    w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
+    return s + " " * max(1, n - w)
+
+
+def service_table(r):
+    """
+    按服务（中台/非中台分开）汇总 run_check 的结果：要求分支、对上几个站、几个 job、实际 SHA。
+    同一服务出现多个 SHA = 浮动分支在发版期间被推了新提交，先发的站代码是旧的 —— 单看分支名发现不了，
+    这里把少数派的站点点名出来。tag（master_V3.11_015）理论上只会有一个 SHA。
+    """
+    from collections import Counter
+    order, svc = [], {}
+    for x in r["rows"]:
+        if x["state"] == "NOJOB" or not re.match(r"^AR\d+$", x["site"]):
+            continue
+        k = x["compKey"]
+        if k not in svc:
+            order.append(k)
+            name = "Admin" if x["comp"] == app.ADMIN_COMP else (x.get("view") or x["comp"])
+            svc[k] = {"name": name + ((" " + x["group"]) if x.get("group") else ""), "expect": x["expect"],
+                      "jobs": 0, "okjobs": 0, "sites": {}, "shas": Counter(), "shasites": {}, "actual": Counter()}
+        s = svc[k]
+        s["jobs"] += 1
+        ok = x["state"] == "OK"
+        s["sites"][x["site"]] = s["sites"].get(x["site"], True) and ok
+        if ok:
+            s["okjobs"] += 1
+            if x.get("actual"):
+                s["actual"][app.normalize_ref(x["actual"])] += 1
+            if x.get("sha"):
+                s["shas"][x["sha"]] += 1
+                s["shasites"].setdefault(x["sha"], set()).add(x["site"])
+                s.setdefault("shats", {})[x["sha"]] = max(s.get("shats", {}).get(x["sha"], 0), x.get("ts") or 0)
+    lines, warns = [], []
+    for k in order:
+        s = svc[k]
+        n_site, ok_site = len(s["sites"]), sum(1 for v in s["sites"].values() if v)
+        br = s["actual"].most_common(1)[0][0] if s["actual"] else s["expect"]
+        if not s["shas"]:
+            ver = "—"
+        elif len(s["shas"]) == 1:
+            ver = next(iter(s["shas"]))
+        else:
+            ver = "%d 个版本" % len(s["shas"])
+        ico = "✅" if ok_site == n_site else "❌"
+        lines.append("%s %s %-18s %3d/%-3d站 %3d job  %s" % (ico, _pad(s["name"], 17), br, ok_site, n_site, s["jobs"], ver))
+        if len(s["shas"]) > 1:
+            # 以「最后一次构建拿到的」为最新（同网页版「代码落后」口径），不是看哪个 SHA 站多：
+            # 发版后半段分支被推了新提交时，最新的反而是少数派
+            newest = max(s["shats"], key=lambda h: s["shats"][h])
+            old = ["`%s` %s" % (h, " ".join(sorted(s["shasites"][h]))) for h in s["shas"] if h != newest]
+            warns.append("⚠ *%s* 代码版本不一致：最新是 `%s`（%d 站）；落后的：%s —— 分支名一样但代码旧，"
+                         "构建那一刻分支上还没有后来的提交。要不要重发落后的站你定" % (
+                             s["name"], newest, len(s["shasites"][newest]), "；".join(old)))
+    return lines, warns
+
+
 def cmd_progress(channel):
     """
     这次发版的站点进度：哪些站全部发完、哪些有问题、哪些发了一部分、哪些还没开始。
@@ -510,12 +572,18 @@ def cmd_progress(channel):
             s["bad"].append("%s %s" % (view, {"VER": "版本不符", "FAIL": "构建失败", "NOVER": "版本未知"}.get(
                 x["state"], x["state"])))
     S = sorted(by.items())
+    svc_lines, sha_warn = service_table(r)
     done = sorted([kv for kv in S if kv[1]["ok"] == kv[1]["n"]], key=lambda kv: -kv[1]["last"])
     bad = [kv for kv in S if kv[1]["bad"]]
     part = [kv for kv in S if not kv[1]["bad"] and kv[1]["ok"] < kv[1]["n"] and (kv[1]["ok"] or kv[1]["run"])]
     none = [kv for kv in S if not kv[1]["bad"] and not kv[1]["ok"] and not kv[1]["run"]]
     nm = lambda k, s: "%s %s" % (k, s["name"]) if s["name"] else k
-    out = ["*发版进度：全部发完 %d / %d 站*  （时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days)]
+    out = ["*发版进度：全部发完 %d / %d 站*  （时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days),
+           "核对口径：每个站的每个服务，看时间窗内最近一次构建 —— 构建成功，且 *Git 实际拉到的分支* = 发布单要求的"
+           "（中台/非中台按站点清单分组分别对）。一个站所有服务都对上才算「全部发完」。",
+           "", "*按服务核对*（要求分支 · 对上的站/该服务总站数 · job 数 · 代码版本）",
+           "```" + "\n".join(svc_lines) + "```"]
+    out += sha_warn
     if done:                                  # 他要的：全部发完的放最前，最近发完的在前
         out.append("\n✅ *全部发完（%d）*" % len(done))
         out.append("　" + "　".join("%s(%s)" % (k, fmt_ts(s["last"])[6:]) for k, s in done))
