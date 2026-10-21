@@ -112,6 +112,8 @@ COMPONENT_ALIAS = {
     "代理后台": "Web", "代理前端": "Web", "代理web": "Web",
     "thirdapi": "ThirdApi",
     "thirdjob": "ThirdJob",
+    # RebateJob：没有分支参数，分支写死在流水线里（10-21 实查 78 个全是 master）
+    "rebatejob": "RebateJob", "rebate": "RebateJob",
 }
 
 
@@ -126,6 +128,7 @@ COMPONENT_VIEW = {
     "Pages": "Web-Pages", "LotteryApi": "LotteryApi", "AgentApi": "AgentApi",
     "Web": "Agent_Web", "WebExtendApi": "WebExtendApi",
     "WebIntranetApi": "WebIntranetApi", "ThirdApi": "ThirdApi", "ThirdJob": "ThirdJob",
+    "RebateJob": "RebateJob",
 }
 # 发布单里会出现、但不在这套 AR 命名的 Jenkins 上的组件
 NOT_IN_JENKINS = {"admin", "sitadmin", "后台", "后台管理"}

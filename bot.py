@@ -197,7 +197,8 @@ def jenkins_index(force=False):
         if not force and _idx["jobs"] is not None and time.time() - _idx["ts"] < INDEX_TTL:
             return _idx["jobs"]
         tree = ("jobs[name,url,property[parameterDefinitions[name,defaultParameterValue[value]]],"
-                "lastBuild[number,result,building,timestamp,actions[parameters[name,value]]]]")
+                "lastBuild[number,result,building,timestamp,actions[parameters[name,value],"
+                "lastBuiltRevision[branch[name]]]]]")
         data = jget(AR, "/api/json" + app._q(tree), timeout=180)
         jobs = {}
         for j in data.get("jobs") or []:
@@ -212,13 +213,16 @@ def jenkins_index(force=False):
                         pname = d["name"]
                         default = ((d.get("defaultParameterValue") or {}).get("value")) or ""
             lb = j.get("lastBuild") or {}
-            last = ""
+            last, got = "", ""
             for a in lb.get("actions") or []:
                 for p in (a or {}).get("parameters") or []:
                     if p.get("name") == pname:
                         last = p.get("value") or ""
-            jobs[name] = {"site": site, "comp": comp, "pname": pname,
-                          "default": default, "last": last, "num": lb.get("number"),
+                rev = (a or {}).get("lastBuiltRevision")
+                if rev and not got:
+                    got = app.normalize_ref(((rev.get("branch") or [{}])[0]).get("name") or "")
+            jobs[name] = {"site": site, "comp": comp, "pname": pname, "got": got,
+                          "default": default, "last": last or got, "num": lb.get("number"),
                           "result": lb.get("result"), "building": bool(lb.get("building")),
                           "ts": (lb.get("timestamp") or 0) / 1000.0}
         _idx.update(ts=time.time(), jobs=jobs)
@@ -393,7 +397,9 @@ HELP = """*jenkins-bot 指令大全*  （频道里 @jenkins-bot 加下面的指�
 • `@jenkins-bot web ar107` 只发 AR107 的 Web-Pages，分支用当前服务清单里 Web 那行
 • `@jenkins-bot web ar107 feature/v3-uat` 临时指定分支（只这一次，不改服务清单）
 • `@jenkins-bot web,thirdjob ar107 ar108` 多个视图、多个站
-　 视图名：web / 前端 / lotteryapi / webextendapi / webintranetapi / agentapi / thirdapi / thirdjob / 代理后台 / admin
+　 视图名（和 Jenkins 一样，大小写随意）：AgentApi / Agent_Web / LotteryApi / RebateJob / ThirdApi / ThirdJob / Web-Pages / WebExtendApi / WebIntranetApi
+　 也认简写：web=Web-Pages、代理后台=Agent_Web；后台那套 Jenkins 的写 admin
+　 RebateJob 没有分支参数（流水线固定拉 master），指定别的分支会被拒绝
 
 *二、查看*
 • `@jenkins-bot 进度` 这次发版哪些站发完了 + 按服务核对表（要求分支、对上几个站、代码版本是否一致）
@@ -804,7 +810,18 @@ def build_plan(site, comps, group_hint, jobs):
         for n in names:
             j = site_jobs[n]
             if not j["pname"]:
-                lines.append("• *%s* `%s` → ❓ 没有 TAG/BRANCH_NAME 参数，不知道该传什么，不发" % (view, n))
+                # 没有分支参数的（RebateJob 全是：分支写死在流水线里）：要求的分支和它实际拉的一致才发，
+                # 不传参数直接 build；发完照样按 Git 实际分支核对。不一致就不发——传不进去，硬发等于发错
+                fixed = j.get("got")
+                want = val if val is not None else app.normalize_ref(c["expect"])
+                if fixed and app.ref_matches(fixed, want):
+                    lines.append("• *%s* `%s`　不传参数（流水线固定拉 `%s`）" % (view, n, fixed))
+                    targets.append({"which": AR, "view": view, "job": n, "pname": "", "value": fixed})
+                elif fixed:
+                    lines.append("• *%s* `%s` → ❌ 没有分支参数，流水线固定拉 `%s`，发不了 `%s`；要改得去改 job 配置"
+                                 % (view, n, fixed, want))
+                else:
+                    lines.append("• *%s* `%s` → ❓ 没有分支参数，也读不到它上次拉的分支，不发" % (view, n))
                 continue
             if val is None:
                 lines.append("• *%s* `%s` → ❌ %s，不发" % (view, n, note))
