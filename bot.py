@@ -450,6 +450,8 @@ def cmd_services(channel, text, user):
         ch = {"comps": comps, "by": user, "at": time.time(), "text": text,
               # 整份发布单里带了站点就顺便记下站点清单；没带就沿用之前 @站点 记的
               "sites": sites or old.get("sites", []), "sites_text": text if sites else old.get("sites_text", "")}
+        if old.get("board"):
+            ch["board"] = old["board"]          # 10-21：整份替换时看板 ts 丢了，之后看板再也不更新且不报错
         STATE["channels"][channel] = ch
         STATE["site_groups"].update(groups)
         save_state(STATE)
@@ -512,13 +514,15 @@ def refresh_board(channel, create=False, force=True):
         text = "📋 *发版看板*  有站点在发布时每 %d 秒自动刷新 · 最后更新 %s\n\n%s" % (
             BOARD_EVERY, time.strftime("%m-%d %H:%M:%S"), body)
         try:
-            if create or not ch.get("board"):
+            if create or not (STATE["channels"].get(channel) or {}).get("board"):
                 r = bolt.client.chat_postMessage(channel=channel, text=text, blocks=_sections(text))
                 with _state_lock:
-                    ch["board"] = {"ts": r["ts"], "at": time.time()}
+                    # 写进频道「当前」的记录：算看板要几秒，这期间清单可能被整份替换，写旧对象等于丢了
+                    STATE["channels"].setdefault(channel, {})["board"] = {"ts": r["ts"], "at": time.time()}
                     save_state(STATE)
             else:
-                bolt.client.chat_update(channel=channel, ts=ch["board"]["ts"], text=text, blocks=_sections(text))
+                ts = (STATE["channels"].get(channel) or {}).get("board", {}).get("ts")
+                bolt.client.chat_update(channel=channel, ts=ts, text=text, blocks=_sections(text))
         except Exception:
             log.exception("board post/update failed")
     finally:
@@ -732,7 +736,7 @@ def cmd_progress(channel, force=True):
     miss_sites = [s for s in ch["sites"] if s not in by]
     if miss_sites:
         out.append("\n❓ 清单里有、但 Jenkins 上没有这些服务的 job：" + "　".join(miss_sites))
-    out += ["⚠ " + w for w in (r.get("warnings") or [])]
+    out += ["⚠ " + w.replace("**", "") for w in (r.get("warnings") or [])]   # 网页版的 **加粗** 在 Slack 显示成星号
     return "\n".join(out)
 
 
