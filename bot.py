@@ -389,6 +389,12 @@ HELP = """*jenkins-bot 指令大全*  （频道里 @jenkins-bot 加下面的指�
 4. 发完在线程里回结论表：每个服务的 Git 实际分支、构建号、时间、代码版本
 5. 接着 `@jenkins-bot 下一个站编号`
 
+*单独发某个视图*  （临时需求，比如「ar107 帮忙部署下 Web，分支 feature/v3-uat」）
+• `@jenkins-bot web ar107` 只发 AR107 的 Web-Pages，分支用当前服务清单里 Web 那行
+• `@jenkins-bot web ar107 feature/v3-uat` 临时指定分支（只这一次，不改服务清单）
+• `@jenkins-bot web,thirdjob ar107 ar108` 多个视图、多个站
+　 视图名：web / 前端 / lotteryapi / webextendapi / webintranetapi / agentapi / thirdapi / thirdjob / 代理后台 / admin
+
 *二、查看*
 • `@jenkins-bot 进度` 这次发版哪些站发完了 + 按服务核对表（要求分支、对上几个站、代码版本是否一致）
 　 后面可以直接贴服务清单或站点清单，先更新再算
@@ -878,11 +884,56 @@ def running_status(site):
         [_line(t) for t in r["targets"]] + ["_结束后会在原来的线程里回结论，不用再 @。_"])
 
 
-def cmd_plan(channel, text, thread, say):
+def parse_view_cmd(t):
+    """
+    「按视图发」：`web ar107` / `web ar107 feature/v3-uat` / `web,thirdjob ar107 ar108`。
+    返回 (视图[(组件名, 写法)], 站点, 分支或None)；不是这种写法返回 None；视图名不在这套 Jenkins 返回错误文本。
+    只认精确别名（不做近似匹配）：认错一个视图就是发错服务。
+    """
+    names, branch, sites = [], None, app.parse_sites(t)
+    if not sites:
+        return None
+    for tok in [x for x in re.split(r"[\s,，、；;]+", t) if x]:
+        if app.parse_sites(tok) or tok in ("中台", "非中台"):
+            continue
+        name, not_here, _ = app.resolve_component(tok)
+        if not_here:
+            return "「%s」在后台那套 Jenkins，但这里没配后台 Jenkins，发不了" % tok
+        if name:
+            if name not in [n for n, _ in names]:
+                names.append((name, tok))
+        elif branch is None and re.search(r"[A-Za-z0-9]", tok):
+            branch = tok
+        else:
+            return None                       # 认不出的词：不当成按视图发，交给原来的逻辑
+    return (names, sites, branch) if names else None
+
+
+def _view_name(n):
+    return "Admin" if n == app.ADMIN_COMP else app.COMPONENT_VIEW.get(n, n)
+
+
+def cmd_plan(channel, text, thread, say, view=None):
+    """view = parse_view_cmd 的结果时：只发指定视图；带分支就临时用这个分支（不改服务清单、不受过期限制）。"""
     ch = STATE["channels"].get(channel)
-    if not ch:
-        say(text="这个频道还没记服务清单。先 `@jenkins-bot 服务` 换行贴发布单。", thread_ts=thread)
+    names, vbranch = (view[0], view[2]) if view else (None, None)
+    if not ch and not vbranch:
+        say(text="这个频道还没记服务清单。先 `@jenkins-bot 服务` 换行贴发布单；"
+                 "或者临时指定分支：`@jenkins-bot web ar107 feature/v3-uat`", thread_ts=thread)
         return
+    if vbranch:
+        comps = [{"key": "%s@@" % n, "name": n, "raw": raw, "expect": vbranch, "group": "", "site": ""}
+                 for n, raw in names]
+    elif names:
+        comps = [c for c in ch["comps"] if c["name"] in [n for n, _ in names]]
+        missing = [raw for n, raw in names if n not in [c["name"] for c in comps]]
+        if missing:
+            say(text="当前服务清单里没有 %s，不知道发哪个分支。在后面写上分支：`@jenkins-bot %s %s 分支名`"
+                     % ("、".join(missing), " ".join(r for _, r in names), " ".join(app.parse_sites(text))),
+                thread_ts=thread)
+            return
+    else:
+        comps = ch["comps"]
     sites = app.parse_sites(text)
     g = "非中台" if re.search(r"非中台", text) else ("中台" if re.search(r"中台", text) else "")
     if g:
@@ -893,7 +944,7 @@ def cmd_plan(channel, text, thread, say):
     # 服务清单一直用最后一次发的，不会自己过期 —— 下次发版忘了重发，就会按上一版的分支发，
     # 而且一切看起来都正常。超过 STALE_SERVICES 没更新就先不给确认按钮，必须重发清单
     # （10-17 他把「沿用」去掉了：每次发版都重发清单）。
-    stale = time.time() - ch.get("at", 0) > STALE_SERVICES
+    stale = not vbranch and time.time() - ch.get("at", 0) > STALE_SERVICES
     jobs = None
     for s in sites:                           # 一个站一条消息、一组按钮，各确认各的
         if s in RUNNING:                      # 正在发的站：直接给当前进度，不出新计划
@@ -901,8 +952,15 @@ def cmd_plan(channel, text, thread, say):
             continue
         if jobs is None:
             jobs = jenkins_index(force=True)  # 出计划用最新状态：要据此判断「正在构建」
-        p = build_plan(s, ch["comps"], g, jobs)
-        p["head"] += "\n_服务清单：%s 设置_" % fmt_ts(ch["at"])
+        p = build_plan(s, comps, g, jobs)
+        if vbranch:
+            p["head"] += "\n_只发：%s · 临时指定分支 `%s`（不改服务清单）_" % (
+                "、".join(_view_name(n) for n, _ in names), vbranch)
+        elif names:
+            p["head"] += "\n_只发：%s · 分支取自服务清单（%s 设置）_" % (
+                "、".join(_view_name(n) for n, _ in names), fmt_ts(ch["at"]))
+        else:
+            p["head"] += "\n_服务清单：%s 设置_" % fmt_ts(ch["at"])
         if stale:
             p["extra"].append("⚠ *服务清单是 %s 设置的（%s前）*  不确定还是不是这次发版的分支。"
                               "请重发 `@jenkins-bot 服务` + 发布单，再 @我 站点编号，我再给确认按钮。"
@@ -1331,7 +1389,12 @@ def handle(text, channel, user, thread=None, say=None):
         return pre + cmd_progress(channel)
     if t.startswith("站点"):
         return cmd_sites(channel, re.sub(r"^站点(清单)?[:：]?", "", t), user)
-    if t.startswith("服务") or app.parse_components(t)[0]:
+    # 「按视图发」必须排在「服务」判断前：`web ar107` 会被发布单解析当成一行「web → ar107」，
+    # 把服务清单改成 Web=ar107
+    view = None if t.startswith("服务") else parse_view_cmd(t)
+    if isinstance(view, str):
+        return view
+    if not view and (t.startswith("服务") or app.parse_components(t)[0]):
         return cmd_services(channel, re.sub(r"^服务[:：]?", "", t), user)
     sites = app.parse_sites(t)
     if len(sites) > MAX_PLAN_SITES:
@@ -1339,7 +1402,7 @@ def handle(text, channel, user, thread=None, say=None):
         return ("一次最多出 %d 个站的计划，你发了 %d 个。\n如果这是这次发版的站点清单，请用 `@jenkins-bot 站点` 开头再发一次。"
                 % (MAX_PLAN_SITES, len(sites)))
     if sites:
-        cmd_plan(channel, t, thread, say)
+        cmd_plan(channel, t, thread, say, view=view)
         return None
     return "没看懂。\n" + HELP
 
