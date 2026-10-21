@@ -380,46 +380,50 @@ def admin_site_jobs(site):
 
 
 # ---------------------------------------------------------------- 文本工具
-HELP = """*jenkins-bot 指令大全*  （频道里 @jenkins-bot 加下面的指令；私聊机器人不用 @）
+HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私聊机器人不用 @）
 
-*一、每次发版的标准流程*
-1. `@jenkins-bot 服务` 换行贴发布单的「服务 → 分支」几行
-　 整份发布单贴进来也行，里面的站点清单、中台/非中台分组会一起记住
-　 例：`Web → 分支：非中台 uat ／ 中台 feature/v3-uat`（分组用 ／ 或 、 隔开）
-2. `@jenkins-bot 站点` 换行贴这次要发的站点清单（带「中台站 / 非中台站」标题）
-　 → 频道里发一条 📋 *发版看板* ，之后有站点在发布时每分钟自动刷新
-3. `@jenkins-bot AR047` 出这个站的发布计划（每个视图发哪个 job、传什么分支）
-　 核对无误点 *确认发布* ，不对点 *取消* ；一次最多 5 个站：`@jenkins-bot AR047 AR048`
-4. 发完在线程里回结论表：每个服务的 Git 实际分支、构建号、时间、代码版本
-5. 接着 `@jenkins-bot 下一个站编号`
+*一、整轮发版*  （多个站、每个站发全部服务）
+1. 记服务清单（每次发版先发一次）：`@jenkins-bot 服务` 换行贴「服务 → 分支」几行
+　 例：`Web → 分支：非中台 uat ／ 中台 feature/v3-uat` ；整份发布单贴进来也行，站点清单和分组会一起记住
+2. 记站点清单：`@jenkins-bot 站点` 换行贴站点清单（带「中台站 / 非中台站」标题）
+　 → 频道里出一条 📋 发版看板，发布中每 60 秒自动刷新
+3. 发某个站（全部服务）：`@jenkins-bot ar107` ；一次最多 5 个站：`@jenkins-bot ar107 ar108`
+4. 机器人回发布计划 → 核对视图和分支 → 点 *确认发布*
+5. 发完线程里回结论表（每个服务的实际分支、构建号、时间、代码版本）→ 接着 @ 下一个站
 
-*单独发某个视图*  （临时需求，比如「ar107 帮忙部署下 Web，分支 feature/v3-uat」）
-• `@jenkins-bot web ar107` 只发 AR107 的 Web-Pages，分支用当前服务清单里 Web 那行
-• `@jenkins-bot web ar107 feature/v3-uat` 临时指定分支（只这一次，不改服务清单）
-• `@jenkins-bot web,thirdjob ar107 ar108` 多个视图、多个站
-　 视图名（和 Jenkins 一样，大小写随意）：AgentApi / Agent_Web / LotteryApi / RebateJob / ThirdApi / ThirdJob / Web-Pages / WebExtendApi / WebIntranetApi
-　 也认简写：web=Web-Pages、代理后台=Agent_Web；后台那套 Jenkins 的写 admin
-　 RebateJob 分支固定是 master，不用写分支：`@jenkins-bot rebatejob ar107` 直接发（写别的分支会被拒绝）
+*二、单独发某个视图*  （临时需求；写法：视图名 + 站点 + 分支，分支只这一次有效，不改服务清单）
+`@jenkins-bot agentapi ar107 master`
+`@jenkins-bot agent_web ar107 master`
+`@jenkins-bot lotteryapi ar107 master_V3.11_017`
+`@jenkins-bot rebatejob ar107` ← 不用写分支，固定 master
+`@jenkins-bot thirdapi ar107 uat`
+`@jenkins-bot thirdjob ar107 uat`
+`@jenkins-bot web-pages ar107 feature/v3-uat` ← 也可以写 web
+`@jenkins-bot webextendapi ar107 master_V3.11_017`
+`@jenkins-bot webintranetapi ar107 master_V3.11_017`
+`@jenkins-bot admin ar107 master_V3.11_010` ← 后台那套 Jenkins
+• 不写分支：用当前服务清单里这个视图的分支　`@jenkins-bot lotteryapi ar107`
+• 多个视图：逗号隔开　`@jenkins-bot lotteryapi,webextendapi,webintranetapi ar107 master_V3.11_017`
+• 多个站：写在后面　`@jenkins-bot web ar107 ar108 feature/v3-uat`
 
-*二、查看*
-• `@jenkins-bot 进度` 这次发版哪些站发完了 + 按服务核对表（要求分支、对上几个站、代码版本是否一致）
-　 后面可以直接贴服务清单或站点清单，先更新再算
-• `@jenkins-bot 看板` 把发版看板重新发到频道最下面
-• `@jenkins-bot 当前` 看机器人现在记着的服务清单
-• `@jenkins-bot 记录 AR035` 这个站机器人发过的记录（谁、什么时候、什么分支、结果；手点的不在里面）
-• `@jenkins-bot 帮助` 或 `help` 看这份说明
+*三、查看*
+`@jenkins-bot 进度` 这次发版哪些站发完了 + 按服务核对表
+`@jenkins-bot 看板` 把发版看板重新发到频道最下面
+`@jenkins-bot 当前` 看记着的服务清单
+`@jenkins-bot 记录 ar107` 这个站机器人发过的记录（手点的不在里面）
+`@jenkins-bot help` 看用法
 
-*三、特殊情况*
-• 站点分组不明时会问你：`@jenkins-bot AR047 中台` / `@jenkins-bot AR047 非中台` （记住，下次不用再说）
-• 服务清单超过 12 小时没更新：计划先不给确认按钮，重发 `@jenkins-bot 服务` 后再出计划
-• 站点正在发布中再 @ 它：直接回当前进度，不会重复发
-• 构建失败：线程里附报错行，结论下面有 *重发失败的 N 个* / *不重发* 按钮（15 分钟内有效）
+*四、遇到这些情况*
+• 机器人问站点是中台还是非中台 → `@jenkins-bot ar107 中台` （会记住）
+• 计划没有确认按钮 → 看计划里的 ❓/⚠：分组未知、服务清单超过 12 小时没更新（重发服务清单）、找不到 job
+• 站点正在发布时再 @ 它 → 直接回当前进度，不会重复发
+• 构建失败 → 线程里附报错行，结论下面有 *重发失败的* 按钮（15 分钟内有效）
 
-*四、规则*
-• 只有授权的人点「确认发布」「重发」才有效；计划 15 分钟内有效，点过一次就失效（连点不会发两遍）
-• 分支简写会展开成全名再传（`v3-uat` → `feature/v3-uat`），参数明确传入，不用 Jenkins 默认值
-• 后台 Admin：build_admin 同一版本只打一次包；版本已对上就直接发本站后台，没对上先打包再发
-• 「发错」= 构建成功但 Git 实际拉到的分支不对；「跳过」= 触发时那个 job 正在构建，没重复触发
+*五、规则*
+• 只有授权的人点「确认发布」「重发」才生效；计划 15 分钟内有效，点一次就失效
+• 参数明确传入，不用 Jenkins 默认值；分支简写自动展开（v3-uat → feature/v3-uat）
+• 后台 build_admin 同一版本只打一次包，版本对上就直接发本站后台
+• 结论标记：✅ 成功　❌ 失败　⚠ 发错（构建成功但实际分支不对）　⏭ 跳过（触发时正在构建）
 • 时间按 UTC+4 显示
 """
 MAX_PLAN_SITES = 5          # 一次最多出几个站的计划：防止把站点清单误当成「发这些站」刷出几十条计划
