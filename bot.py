@@ -383,7 +383,7 @@ HELP = """*jenkins-bot 指令大全*  （频道里 @jenkins-bot 加下面的指�
 　 整份发布单贴进来也行，里面的站点清单、中台/非中台分组会一起记住
 　 例：`Web → 分支：非中台 uat ／ 中台 feature/v3-uat`（分组用 ／ 或 、 隔开）
 2. `@jenkins-bot 站点` 换行贴这次要发的站点清单（带「中台站 / 非中台站」标题）
-　 → 频道里发一条 📋 *发版看板* ，之后每发完一个站自动更新
+　 → 频道里发一条 📋 *发版看板* ，之后有站点在发布时每分钟自动刷新
 3. `@jenkins-bot AR047` 出这个站的发布计划（每个视图发哪个 job、传什么分支）
 　 核对无误点 *确认发布* ，不对点 *取消* ；一次最多 5 个站：`@jenkins-bot AR047 AR048`
 4. 发完在线程里回结论表：每个服务的 Git 实际分支、构建号、时间、代码版本
@@ -462,7 +462,7 @@ def cmd_services(channel, text, user):
         out.append("站点分组也记住了：" + "、".join("%s=%s" % kv for kv in sorted(groups.items())))
     if sites:
         board_async(channel, create=True)
-        out.append("站点清单也记下了：%d 个站。📋 发版看板已发在频道里，每发完一个站自动更新" % len(sites))
+        out.append("站点清单也记下了：%d 个站。📋 发版看板已发在频道里，有站点在发布时每分钟自动刷新" % len(sites))
     out += ["⚠ " + w for w in warns]
     return "\n".join(out)
 
@@ -480,29 +480,37 @@ def cmd_sites(channel, text, user):
     gs = {}
     for s in sites:
         gs.setdefault(groups.get(s) or "未分组", []).append(s)
-    board_async(channel, create=True)          # 新一轮发版：频道里发一条看板，之后每发完一个站自动更新
-    return ("已记下这次发版的 %d 个站点（%s）。\n📋 发版看板已发在频道里，每发完一个站自动更新；"
+    board_async(channel, create=True)          # 新一轮发版：频道里发一条看板，之后有站点在发布时每分钟自动刷新
+    return ("已记下这次发版的 %d 个站点（%s）。\n📋 发版看板已发在频道里，有站点在发布时每分钟自动刷新；"
             "也可以随时 `@jenkins-bot 进度`。" % (len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items())))
 
 
-# ---------------------------------------------------------------- 发版看板：频道里一条消息，每发完一个站自动更新
+# ---------------------------------------------------------------- 发版看板：频道里一条消息，发布中每分钟自动刷新
 _board_lock = threading.Lock()
+_board_busy = set()                 # 正在刷新的频道：上一次还没算完就跳过，不叠着打 Jenkins
+BOARD_EVERY = int(os.environ.get("BOT_BOARD_EVERY", "60"))
 
 
-def refresh_board(channel, create=False):
-    """内容就是「进度」。create=True 发一条新的（新一轮发版 / 他要求重发看板），否则原地更新那一条。"""
+def refresh_board(channel, create=False, force=True):
+    """内容就是「进度」。create=True 发一条新的（新一轮发版 / 他要求重发看板），否则原地更新那一条。
+    force=False 走 run_check 的缓存（有效期约 1 分钟），给定时刷新用，免得每分钟全量打一次 Jenkins。"""
     ch = STATE["channels"].get(channel)
     if not ch or not ch.get("sites") or not ch.get("comps"):
         return
     if not create and not ch.get("board"):
         return                                   # 没开过看板就不自动开，免得频道里冒出意料外的消息
-    try:
-        body = cmd_progress(channel)
-    except Exception as e:
-        log.exception("board progress failed")
-        body = "看板刷新失败：%s: %s" % (type(e).__name__, str(e)[:200])
-    text = "📋 *发版看板*  每发完一个站自动更新 · 最后更新 %s\n\n%s" % (fmt_ts(time.time()), body)
     with _board_lock:
+        if channel in _board_busy:
+            return
+        _board_busy.add(channel)
+    try:
+        try:
+            body = cmd_progress(channel, force=force)
+        except Exception as e:
+            log.exception("board progress failed")
+            body = "看板刷新失败：%s: %s" % (type(e).__name__, str(e)[:200])
+        text = "📋 *发版看板*  有站点在发布时每 %d 秒自动刷新 · 最后更新 %s\n\n%s" % (
+            BOARD_EVERY, time.strftime("%m-%d %H:%M:%S"), body)
         try:
             if create or not ch.get("board"):
                 r = bolt.client.chat_postMessage(channel=channel, text=text, blocks=_sections(text))
@@ -513,10 +521,28 @@ def refresh_board(channel, create=False):
                 bolt.client.chat_update(channel=channel, ts=ch["board"]["ts"], text=text, blocks=_sections(text))
         except Exception:
             log.exception("board post/update failed")
+    finally:
+        with _board_lock:
+            _board_busy.discard(channel)
 
 
-def board_async(channel, create=False):
-    threading.Thread(target=refresh_board, args=(channel, create), daemon=True).start()
+def board_async(channel, create=False, force=True):
+    threading.Thread(target=refresh_board, args=(channel, create, force), daemon=True).start()
+
+
+def board_ticker():
+    """10-21 他嫌看板慢：原来只在一个站整个发完（5~6 分钟）才更新。
+    现在只要有站点在发布，就每 BOARD_EVERY 秒刷新一次；没有在发的就不刷，不白打 Jenkins。"""
+    while True:
+        time.sleep(BOARD_EVERY)
+        try:
+            if not RUNNING:
+                continue
+            for cid, ch in list(STATE["channels"].items()):
+                if ch.get("board"):
+                    refresh_board(cid, force=False)
+        except Exception:
+            log.exception("board ticker")
 
 
 # ---------------------------------------------------------------- 发布记录：每次确认/触发/结果都追加一行，永久保留
@@ -547,9 +573,9 @@ def cmd_history(text):
     for s in sites:
         rs = [r for r in rows if r.get("site") == s and r.get("event") in ("confirm", "result")][-25:]
         if not rs:
-            out.append("*%s*：机器人还没发过这个站（记录从 10-17 开始）" % s)
+            out.append("*%s* ：机器人还没发过这个站（记录从 10-17 开始）" % s)
             continue
-        out.append("*%s 最近的发布记录*（机器人发的；手点的不在这里）" % s)
+        out.append("*%s 最近的发布记录*  （机器人发的；手点的不在这里）" % s)
         lines = []
         for r in rs:
             if r["event"] == "confirm":
@@ -606,6 +632,8 @@ def service_table(r):
         s["jobs"] += 1
         ok = x["state"] == "OK"
         s["sites"][x["site"]] = s["sites"].get(x["site"], True) and ok
+        if x["state"] in ("VER", "FAIL", "NOVER"):
+            s["bad"] = s.get("bad", 0) + 1     # 真有问题才标 ❌；还没发到的只是 ⏳
         if ok:
             s["okjobs"] += 1
             if x.get("actual"):
@@ -625,7 +653,7 @@ def service_table(r):
             ver = next(iter(s["shas"]))
         else:
             ver = "%d 个版本" % len(s["shas"])
-        ico = "✅" if ok_site == n_site else "❌"
+        ico = "✅" if ok_site == n_site else ("❌" if s.get("bad") else "⏳")
         lines.append("%s %s %-18s %3d/%-3d站 %3d job  %s" % (ico, _pad(s["name"], 17), br, ok_site, n_site, s["jobs"], ver))
         if len(s["shas"]) > 1:
             # 以「最后一次构建拿到的」为最新（同网页版「代码落后」口径），不是看哪个 SHA 站多：
@@ -638,7 +666,7 @@ def service_table(r):
     return lines, warns
 
 
-def cmd_progress(channel):
+def cmd_progress(channel, force=True):
     """
     这次发版的站点进度：哪些站全部发完、哪些有问题、哪些发了一部分、哪些还没开始。
     直接用网页版的 run_check（同一套解析、同一套判定），时间窗从记下服务清单那天到今天。
@@ -654,7 +682,7 @@ def cmd_progress(channel):
     text = (ch.get("sites_text") or "") + "\n" + comps_to_text(ch["comps"])
     d0 = datetime.fromtimestamp(ch["at"]).date()
     days = (datetime.now().date() - d0).days + 1
-    r = app.run_check(text, d0.strftime("%Y-%m-%d"), days, ["AR000"], False, True, J_USER, J_TOKEN)
+    r = app.run_check(text, d0.strftime("%Y-%m-%d"), days, ["AR000"], False, force, J_USER, J_TOKEN)
     if not r.get("ok"):
         return "算进度失败：" + "；".join(r.get("warnings") or ["没解析出内容"])
     by = {}
@@ -663,7 +691,7 @@ def cmd_progress(channel):
             continue                                     # 「后台构建」那种汇总行不算站点
         s = by.setdefault(x["site"], {"name": x.get("siteName") or "", "n": 0, "ok": 0, "run": 0,
                                        "miss": [], "bad": [], "last": 0})
-        view = x.get("view") or x["comp"]
+        view = "Admin" if x["comp"] == app.ADMIN_COMP else (x.get("view") or x["comp"])
         s["n"] += 1
         if x["state"] == "OK":
             s["ok"] += 1
@@ -686,7 +714,7 @@ def cmd_progress(channel):
     out = ["*发版进度：全部发完 %d / %d 站*  （时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days),
            "核对口径：每个站的每个服务，看时间窗内最近一次构建 —— 构建成功，且 *Git 实际拉到的分支* = 发布单要求的"
            "（中台/非中台按站点清单分组分别对）。一个站所有服务都对上才算「全部发完」。",
-           "", "*按服务核对*（要求分支 · 对上的站/该服务总站数 · job 数 · 代码版本）",
+           "", "*按服务核对*  （要求分支 · 对上的站/该服务总站数 · job 数 · 代码版本）",
            "```" + "\n".join(svc_lines) + "```"]
     out += sha_warn
     if done:                                  # 他要的：全部发完的放最前，最近发完的在前
@@ -872,7 +900,7 @@ def cmd_plan(channel, text, thread, say):
         p = build_plan(s, ch["comps"], g, jobs)
         p["head"] += "\n_服务清单：%s 设置_" % fmt_ts(ch["at"])
         if stale:
-            p["extra"].append("⚠ *服务清单是 %s 设置的（%s前）*，不确定还是不是这次发版的分支。"
+            p["extra"].append("⚠ *服务清单是 %s 设置的（%s前）*  不确定还是不是这次发版的分支。"
                               "请重发 `@jenkins-bot 服务` + 发布单，再 @我 站点编号，我再给确认按钮。"
                               % (fmt_ts(ch["at"]), _ago(ch["at"])))
         pid = uuid.uuid4().hex[:12]
@@ -1255,6 +1283,7 @@ def on_confirm(ack, body, client):
     rlog(event="confirm", site=p["site"], user=user, retry=bool(p.get("summary")),
          jobs=["%s %s=%s" % (t["job"], t["pname"], t["value"]) if t["pname"] else t["job"] for t in p["targets"]])
     threading.Thread(target=run_release, args=(p, user, client), daemon=True).start()
+    board_async(ch)                     # 站点一确认，看板马上显示它在「构建中」
 
 
 @bolt.action("cancel")
@@ -1285,7 +1314,7 @@ def handle(text, channel, user, thread=None, say=None):
         if not (STATE["channels"].get(channel) or {}).get("sites"):
             return "还没记这次发版的站点清单。先 `@jenkins-bot 站点` 贴站点清单，我再发看板。"
         board_async(channel, create=True)
-        return "📋 看板已重新发在频道最下面，之后每发完一个站自动更新这一条。"
+        return "📋 看板已重新发在频道最下面，发布中每分钟自动刷新这一条。"
     if t.startswith("记录"):
         return cmd_history(t)
     if t.startswith("进度"):
@@ -1341,4 +1370,5 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     log.info("jenkins-bot starting, state=%s, allowed=%s", STATE_FILE, sorted(ALLOWED))
     resume_all(bolt.client)
+    threading.Thread(target=board_ticker, daemon=True).start()
     SocketModeHandler(bolt, os.environ["SLACK_APP_TOKEN"]).start()
