@@ -399,7 +399,7 @@ HELP = """*jenkins-bot 指令大全*  （频道里 @jenkins-bot 加下面的指�
 • `@jenkins-bot web,thirdjob ar107 ar108` 多个视图、多个站
 　 视图名（和 Jenkins 一样，大小写随意）：AgentApi / Agent_Web / LotteryApi / RebateJob / ThirdApi / ThirdJob / Web-Pages / WebExtendApi / WebIntranetApi
 　 也认简写：web=Web-Pages、代理后台=Agent_Web；后台那套 Jenkins 的写 admin
-　 RebateJob 没有分支参数（流水线固定拉 master），指定别的分支会被拒绝
+　 RebateJob 分支固定是 master，不用写分支：`@jenkins-bot rebatejob ar107` 直接发（写别的分支会被拒绝）
 
 *二、查看*
 • `@jenkins-bot 进度` 这次发版哪些站发完了 + 按服务核对表（要求分支、对上几个站、代码版本是否一致）
@@ -814,7 +814,7 @@ def build_plan(site, comps, group_hint, jobs):
                 # 不传参数直接 build；发完照样按 Git 实际分支核对。不一致就不发——传不进去，硬发等于发错
                 fixed = j.get("got")
                 want = val if val is not None else app.normalize_ref(c["expect"])
-                if fixed and app.ref_matches(fixed, want):
+                if fixed and (c.get("fixed") or app.ref_matches(fixed, want)):   # fixed=没写分支，按它固定拉的发
                     lines.append("• *%s* `%s`　不传参数（流水线固定拉 `%s`）" % (view, n, fixed))
                     targets.append({"which": AR, "view": view, "job": n, "pname": "", "value": fixed})
                 elif fixed:
@@ -934,23 +934,39 @@ def cmd_plan(channel, text, thread, say, view=None):
     """view = parse_view_cmd 的结果时：只发指定视图；带分支就临时用这个分支（不改服务清单、不受过期限制）。"""
     ch = STATE["channels"].get(channel)
     names, vbranch = (view[0], view[2]) if view else (None, None)
-    if not ch and not vbranch:
-        say(text="这个频道还没记服务清单。先 `@jenkins-bot 服务` 换行贴发布单；"
-                 "或者临时指定分支：`@jenkins-bot web ar107 feature/v3-uat`", thread_ts=thread)
-        return
+    used_list = False                     # 有没有从服务清单取分支（取了才做 12 小时过期检查）
     if vbranch:
         comps = [{"key": "%s@@" % n, "name": n, "raw": raw, "expect": vbranch, "group": "", "site": ""}
                  for n, raw in names]
     elif names:
-        comps = [c for c in ch["comps"] if c["name"] in [n for n, _ in names]]
-        missing = [raw for n, raw in names if n not in [c["name"] for c in comps]]
+        listed = (ch or {}).get("comps") or []
+        comps, missing, idx = [], [], None
+        for n, raw in names:
+            got = [c for c in listed if c["name"] == n]
+            if got:
+                comps += got
+                used_list = True
+                continue
+            # 没有分支参数的视图（RebateJob：流水线写死 master）不用写分支，按它固定拉的发（10-21 他要求）
+            idx = idx or jenkins_index()
+            js = [j for j in idx.values() if j["comp"] == n]
+            if js and all(not j["pname"] for j in js):
+                comps.append({"key": "%s@@" % n, "name": n, "raw": raw, "expect": "", "group": "", "site": "",
+                              "fixed": True})
+            else:
+                missing.append(raw)
         if missing:
             say(text="当前服务清单里没有 %s，不知道发哪个分支。在后面写上分支：`@jenkins-bot %s %s 分支名`"
                      % ("、".join(missing), " ".join(r for _, r in names), " ".join(app.parse_sites(text))),
                 thread_ts=thread)
             return
     else:
+        if not ch:
+            say(text="这个频道还没记服务清单。先 `@jenkins-bot 服务` 换行贴发布单；"
+                     "或者按视图发：`@jenkins-bot web ar107 feature/v3-uat`", thread_ts=thread)
+            return
         comps = ch["comps"]
+        used_list = True
     sites = app.parse_sites(text)
     g = "非中台" if re.search(r"非中台", text) else ("中台" if re.search(r"中台", text) else "")
     if g:
@@ -961,7 +977,7 @@ def cmd_plan(channel, text, thread, say, view=None):
     # 服务清单一直用最后一次发的，不会自己过期 —— 下次发版忘了重发，就会按上一版的分支发，
     # 而且一切看起来都正常。超过 STALE_SERVICES 没更新就先不给确认按钮，必须重发清单
     # （10-17 他把「沿用」去掉了：每次发版都重发清单）。
-    stale = not vbranch and time.time() - ch.get("at", 0) > STALE_SERVICES
+    stale = used_list and time.time() - ch.get("at", 0) > STALE_SERVICES
     jobs = None
     for s in sites:                           # 一个站一条消息、一组按钮，各确认各的
         if s in RUNNING:                      # 正在发的站：直接给当前进度，不出新计划
@@ -974,8 +990,9 @@ def cmd_plan(channel, text, thread, say, view=None):
             p["head"] += "\n_只发：%s · 临时指定分支 `%s`（不改服务清单）_" % (
                 "、".join(_view_name(n) for n, _ in names), vbranch)
         elif names:
-            p["head"] += "\n_只发：%s · 分支取自服务清单（%s 设置）_" % (
-                "、".join(_view_name(n) for n, _ in names), fmt_ts(ch["at"]))
+            p["head"] += "\n_只发：%s · %s_" % (
+                "、".join(_view_name(n) for n, _ in names),
+                ("分支取自服务清单（%s 设置）" % fmt_ts(ch["at"])) if used_list else "流水线固定分支，不用指定")
         else:
             p["head"] += "\n_服务清单：%s 设置_" % fmt_ts(ch["at"])
         if stale:
