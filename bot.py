@@ -407,8 +407,7 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 • 多个站：写在后面　`@jenkins-bot web ar107 ar108 feature/v3-uat`
 
 *三、查看*
-`@jenkins-bot 进度` 这次发版哪些站发完了 + 按服务核对表
-`@jenkins-bot 看板` 把发版看板重新发到频道最下面
+`@jenkins-bot 进度` 把发版看板重新发到频道最下面（哪些站发完了 + 按服务核对表，自动刷新；写 `看板` 也一样）
 `@jenkins-bot 当前` 看记着的服务清单
 `@jenkins-bot 记录 ar107` 这个站机器人发过的记录（手点的不在里面）
 `@jenkins-bot help` 看用法
@@ -531,7 +530,14 @@ def refresh_board(channel, create=False, force=True):
             BOARD_EVERY, time.strftime("%m-%d %H:%M:%S"), body)
         try:
             if create or not (STATE["channels"].get(channel) or {}).get("board"):
+                old = ((STATE["channels"].get(channel) or {}).get("board") or {}).get("ts")
                 r = bolt.client.chat_postMessage(channel=channel, text=text, blocks=_sections(text))
+                if old:                          # 旧看板停更了，留着原样会让人以为进度卡住
+                    try:
+                        moved = "📋 看板已移到频道下面最新一条，这条不再更新。"
+                        bolt.client.chat_update(channel=channel, ts=old, text=moved, blocks=_sections(moved))
+                    except Exception:
+                        log.warning("retire old board failed")
                 with _state_lock:
                     # 写进频道「当前」的记录：算看板要几秒，这期间清单可能被整份替换，写旧对象等于丢了
                     STATE["channels"].setdefault(channel, {})["board"] = {"ts": r["ts"], "at": time.time()}
@@ -1410,21 +1416,23 @@ def handle(text, channel, user, thread=None, say=None):
         return HELP
     if t.startswith("当前"):
         return cmd_current(channel)
-    if t.startswith("看板"):
-        if not (STATE["channels"].get(channel) or {}).get("sites"):
-            return "还没记这次发版的站点清单。先 `@jenkins-bot 站点` 贴站点清单，我再发看板。"
-        board_async(channel, create=True)
-        return "📋 看板已重新发在频道最下面，发布中每分钟自动刷新这一条。"
     if t.startswith("记录"):
         return cmd_history(t)
-    if t.startswith("进度"):
-        rest = re.sub(r"^进度[:：]?", "", t)
-        pre = ""
-        if app.parse_components(rest)[0]:          # 「进度」后面顺手贴了服务清单 → 先更新清单再算
-            pre = cmd_services(channel, rest, user).split("\n")[0] + "\n\n"
-        elif app.parse_sites(rest):                # 后面贴的是站点清单 → 先记站点再算
-            pre = cmd_sites(channel, rest, user) + "\n\n"
-        return pre + cmd_progress(channel)
+    if t.startswith("进度") or t.startswith("看板"):
+        # 10-22 他指出「进度」和「看板」重复：内容一样，看板还会自动刷新。合并成一个——都把看板重发到最下面
+        rest = re.sub(r"^(进度|看板)[:：]?", "", t)
+        pre, created = "", False
+        if app.parse_components(rest)[0]:          # 后面顺手贴了服务清单 → 先更新清单（带站点的会自己开看板）
+            pre = cmd_services(channel, rest, user).split("\n")[0] + "\n"
+            created = bool(app.parse_sites(rest))
+        elif app.parse_sites(rest):                # 后面贴的是站点清单 → 先记站点（会自己开看板）
+            pre = cmd_sites(channel, rest, user).split("\n")[0] + "\n"
+            created = True
+        if not (STATE["channels"].get(channel) or {}).get("sites"):
+            return pre + "还没记这次发版的站点清单。先 `@jenkins-bot 站点` 换行贴站点清单，看板会发在频道里。"
+        if not created:
+            board_async(channel, create=True)
+        return pre + "📋 看板已发在频道最下面，有站点在发布时每 60 秒自动刷新。"
     if t.startswith("站点"):
         return cmd_sites(channel, re.sub(r"^站点(清单)?[:：]?", "", t), user)
     # 「按视图发」必须排在「服务」判断前：`web ar107` 会被发布单解析当成一行「web → ar107」，
