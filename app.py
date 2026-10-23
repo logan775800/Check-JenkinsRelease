@@ -1339,10 +1339,22 @@ async function check(force,isPoll){
     const c=creds();
     const hdr={'Content-Type':'application/json'};
     if(c.u&&c.t){hdr['X-Jenkins-User']=c.u;hdr['X-Jenkins-Token']=c.t;}
-    const r=await fetch('/api/check',{method:'POST',headers:hdr,
-      body:JSON.stringify({text:t,date:$('date').value,days:+$('days').value,
-        exclude:$('ex').value.split(/[,，\s]+/),all:$('all').checked,force:!!force})});
-    const d=await r.json();
+    const body=JSON.stringify({text:t,date:$('date').value,days:+$('days').value,
+        exclude:$('ex').value.split(/[,，\s]+/),all:$('all').checked,force:!!force});
+    // 浏览器→Cloudflare 这段偶发断连(NetworkError)，服务器日志里根本没有这次请求；
+    // 接口只读、重发无副作用，所以断连和 CF 的 502/503/504/52x 自动重试，都不行才报错
+    const waits=[1000,3000,6000];
+    let d=null,lastErr='';
+    for(let i=0;i<=waits.length;i++){
+      if(i){$('go').textContent='网络中断，重试 '+i+'/'+waits.length+'…';await new Promise(ok=>setTimeout(ok,waits[i-1]));}
+      let r;
+      try{r=await fetch('/api/check',{method:'POST',headers:hdr,body:body});}
+      catch(e){lastErr='连不上服务器（'+e.message+'）';continue;}
+      if([502,503,504,520,521,522,523,524].includes(r.status)){lastErr='网关返回 HTTP '+r.status;continue;}
+      try{d=await r.json();}catch(e){lastErr='HTTP '+r.status+'，返回的不是 JSON';d=null;}
+      break;
+    }
+    if(!d){$('out').innerHTML='<div class="card warn">请求失败：'+esc(lastErr)+'，已自动重试 '+waits.length+' 次。服务器没收到/没回这次请求，多半是本机网络到 Cloudflare 这段断了，稍后再点一次。</div>';return;}
     if(d.error){
       $('out').innerHTML='<div class="card warn">出错：'+esc(d.error)+'</div>';
       if(d.needCreds){$('credcard').style.display='';$('credcard').scrollIntoView({behavior:'smooth'});}
