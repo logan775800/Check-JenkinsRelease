@@ -738,8 +738,7 @@ def cmd_progress(channel, force=True):
     none = [kv for kv in S if not kv[1]["bad"] and not kv[1]["ok"] and not kv[1]["run"]]
     nm = lambda k, s: "%s %s" % (k, s["name"]) if s["name"] else k
     out = ["*发版进度：全部发完 %d / %d 站*  （时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days),
-           "核对口径：每个站的每个服务，看时间窗内最近一次构建 —— 构建成功，且 *Git 实际拉到的分支* = 发布单要求的"
-           "（中台/非中台按站点清单分组分别对）。一个站所有服务都对上才算「全部发完」。",
+           "判定：每个服务最近一次构建成功 + 实际拉的分支对 → 该站发完",
            "", "*按服务核对*  （要求分支 · 对上的站/该服务总站数 · job 数 · 代码版本）",
            "```" + "\n".join(svc_lines) + "```"]
     out += sha_warn
