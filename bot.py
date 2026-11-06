@@ -863,15 +863,16 @@ def plan_text(p):
 
 
 def _sections(text):
-    """Slack section 文本上限 3000 字符，长计划按行切块。"""
+    """Slack section 文本上限 3000 字符，长计划按行切块。
+    expand=True：不让 Slack 折叠成「显示更多」（他每次都要点开看，11-06 提的）。"""
     blocks, buf = [], ""
     for ln in text.split("\n"):
         if len(buf) + len(ln) + 1 > 2900:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": buf}})
+            blocks.append({"type": "section", "expand": True, "text": {"type": "mrkdwn", "text": buf}})
             buf = ""
         buf += ln + "\n"
     if buf.strip():
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": buf}})
+        blocks.append({"type": "section", "expand": True, "text": {"type": "mrkdwn", "text": buf}})
     return blocks
 
 
