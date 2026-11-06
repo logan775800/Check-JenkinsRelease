@@ -459,6 +459,8 @@ def normalize_ref(s):
     """Git 插件把分支记成 refs/remotes/origin/xxx，参数里写的是 xxx，不剥前缀会满屏假告警。"""
     if not s:
         return ""
+    # 手点构建时粘贴进来的首尾空白/Tab（11-06 AR042 #25 是 "feature/v3-uat\t"），Git 会忽略，比较时也要忽略
+    s = s.strip()
     for p in ("refs/remotes/", "refs/heads/", "origin/"):
         if s.startswith(p):
             s = s[len(p):]
