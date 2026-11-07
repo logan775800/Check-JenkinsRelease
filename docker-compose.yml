@@ -53,6 +53,9 @@ services:
     image: jenkins-bot:latest
     container_name: jenkins-bot
     restart: always
+    # 用宿主机网络：后台检查要连宿主机 127.0.0.1:18765（ssh 反向隧道只绑回环），
+    # bridge 网络的容器连不到宿主机回环。机器人只主动往外连，不开端口，用 host 网络没有额外暴露。
+    network_mode: host
     env_file:
       - .env
       - path: /data/release-bot/.env

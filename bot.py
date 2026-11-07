@@ -51,6 +51,11 @@ PLAN_TTL = 15 * 60          # 计划出了 15 分钟没确认就作废：Jenkins
 STALE_SERVICES = float(os.environ.get("BOT_STALE_HOURS", "12")) * 3600   # 服务清单多久没更新算「可能过期」
 POLL_EVERY = 8
 RUN_TIMEOUT = 40 * 60       # 单个站点发布最长等多久，超了报「超时」而不是一直挂着
+# 发完检查后台能不能打开（11-06 AR088 后台发完崩了，Jenkins 照样报成功）。
+# 后台前面的 Cloudflare 只放白名单 IP，机器人这台不在里面 → 经反向隧道借 Logan 固定 IP 电脑上的
+# tools/admin_probe_agent.py 去访问。空字符串 = 关掉检测。
+ADMIN_PROBE = os.environ.get("BOT_ADMIN_PROBE", "http://127.0.0.1:18765")
+PROBE_TRIES, PROBE_GAP = 3, 20  # 刚部署完 IIS 要预热，不正常就隔 20 秒再看，最多 3 次
 
 # BOT_OFFLINE=1：本地测试 handle() 时不去 Slack 校验 token
 bolt = App(token=os.environ["SLACK_BOT_TOKEN"],
@@ -417,6 +422,7 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 • 计划没有确认按钮 → 看计划里的 ❓/⚠：分组未知、服务清单超过 12 小时没更新（重发服务清单）、找不到 job
 • 站点正在发布时再 @ 它 → 直接回当前进度，不会重复发
 • 构建失败 → 线程里附报错行，结论下面有 *重发失败的* 按钮（15 分钟内有效）
+• 每个站发完自动打开本站后台地址检查：崩了（服务器错误/打不开）→ Admin 判 ❌ 并给重发按钮；结论里 🌐 那行就是检查结果
 
 *五、规则*
 • 只有授权的人点「确认发布」「重发」才生效；计划 15 分钟内有效，点一次就失效
@@ -1042,6 +1048,8 @@ def _verdict(t):
             return "⚠", "发错：应为 `%s`，Git 实际拉到 `%s`" % (t["value"], got), "wrong"
         if not got and want and not app.ref_matches(want, t["value"]):
             return "⚠", "发错：实际参数 `%s`，应为 `%s`" % (want, t["value"]), "wrong"
+    if t.get("probe_bad"):
+        return "❌", "部署成功但后台打不开：%s" % t["probe_bad"], "bad"
     if t.get("admin_note"):
         return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
@@ -1100,7 +1108,55 @@ def _retryable(t):
     st = t.get("state")
     if st in ("trigger_err", "cancelled", "admin_err"):
         return True
-    return st == "done" and (t.get("build") or {}).get("result") != "SUCCESS"
+    return st == "done" and ((t.get("build") or {}).get("result") != "SUCCESS" or bool(t.get("probe_bad")))
+
+
+def admin_probe(site):
+    """发完访问本站后台地址。返回 (状态, 每个地址的结果, 出错原因)。
+    状态：ok 全部正常 / bad 有地址崩了或打不开 / unknown 被拦、看不出 / none 清单里没这个站 / unavailable 探测程序连不上。
+    不正常的隔 PROBE_GAP 秒再试，最多 PROBE_TRIES 次（IIS 刚换包第一次请求可能慢或 503）。"""
+    if not ADMIN_PROBE:
+        return "unavailable", [], "检测已关闭（BOT_ADMIN_PROBE 为空）"
+    last = ("unknown", [], "")
+    for i in range(PROBE_TRIES):
+        try:
+            with urllib.request.urlopen(ADMIN_PROBE.rstrip("/") + "/check?site=" + q(site), timeout=150) as r:
+                d = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            return "unavailable", [], str(getattr(e, "reason", e))[:150]
+        res = d.get("results") or []
+        if not res:
+            return "none", [], ""
+        vs = {x.get("verdict") for x in res}
+        last = ("bad" if "bad" in vs else "unknown" if "unknown" in vs else "ok", res, "")
+        if last[0] == "ok":
+            break
+        if i < PROBE_TRIES - 1:
+            time.sleep(PROBE_GAP)
+    return last
+
+
+def probe_lines(site, probe, has_admin):
+    """结论里「后台检查」那几行。"""
+    if not probe:
+        return []
+    st, res, err = probe
+    if st == "unavailable":
+        return ["🌐 *后台检查做不了* ：探测程序连不上（Logan 电脑上的 AdminProbeTunnel 没在跑或隧道断了：%s）"
+                "，请手动打开 %s 后台看一眼" % (err, site)]
+    if st == "none":
+        return ["🌐 后台检查：清单里没有 %s 的后台地址，没检查（在 admin_urls.csv 里补上）" % site]
+    ico = {"ok": "✅", "bad": "❌", "unknown": "❓"}
+    out = []
+    for x in res:
+        out.append("🌐 后台 %s %s  %s" % (ico.get(x.get("verdict"), "❓"), x.get("why", ""), x.get("url", "")))
+    if st == "bad":
+        out.append("   ↳ 隔 %d 秒重试了 %d 次仍不正常。%s" % (
+            PROBE_GAP, PROBE_TRIES, "Admin 已标成失败，可以点下面的重发" if has_admin
+            else "这次没发 Admin，后台可能本来就有问题，请手动看"))
+    elif st == "unknown":
+        out.append("   ↳ 看不出好坏，请手动打开确认")
+    return out
 
 
 def retry_blocks(rp, pid):
@@ -1118,7 +1174,7 @@ def retry_blocks(rp, pid):
              "text": "参数和刚才一样；15 分钟内有效。先看上面的日志确认原因再点。"}]}]
 
 
-def summary_text(site, disp, targets, user, started):
+def summary_text(site, disp, targets, user, started, probe=None):
     """发完后的结论：像 release 机器人那样一张表列出本次每个服务的实际分支，问题项再单独列链接。"""
     cats = {}
     for t in targets:
@@ -1143,6 +1199,7 @@ def summary_text(site, disp, targets, user, started):
             ico, name, br, ("#%s" % t["num"]) if t.get("num") else "—",
             fmt_ts(_end_ts(t)) if t.get("build") else "—", b.get("sha") or ""))
     lines = [title, "```" + "\n".join(rows) + "```"]
+    lines += probe_lines(site, probe, any(t["which"] == ADMIN for t in targets))
     for k in ("bad", "wrong", "skip"):
         lines += [_line(t) for t in cats.get(k, [])]
     lines.append("用时 %d 分钟（%s 起）。可以接着 @我 下一个站。" % (
@@ -1293,6 +1350,21 @@ def run_release(p, user, client, resume=None):
             if snap() != last:                # 后台线程也会改状态，按快照比
                 render()
                 last = snap()
+        # 3b. 发完检查后台能不能打开；Admin 部署「成功」但后台崩了 → Admin 改判失败，进重发
+        probe = None
+        try:
+            probe = admin_probe(site)
+            if probe[0] == "bad":
+                why = "；".join(x.get("why", "") for x in probe[1] if x.get("verdict") == "bad")
+                for t in targets:
+                    if t["which"] == ADMIN and t.get("state") == "done" and \
+                            (t.get("build") or {}).get("result") == "SUCCESS":
+                        t["probe_bad"] = why or "打不开"
+            rlog(event="admin_probe", site=site, status=probe[0], error=probe[2] or None,
+                 results=[{k: x.get(k) for k in ("url", "verdict", "why", "code")} for x in probe[1]])
+        except Exception as e:
+            log.exception("admin probe failed")
+            probe = ("unavailable", [], "%s: %s" % (type(e).__name__, str(e)[:120]))
         render(final=True)
         thread = p.get("thread") or p["ts"]
         # 4a. 构建失败的附日志最后几行：多数时候看这几行就知道原因，省得点进 Jenkins 翻
@@ -1307,7 +1379,7 @@ def run_release(p, user, client, resume=None):
                 except Exception as e:
                     log.warning("console tail %s: %s", t["job"], e)
         # 4b. 结论单独发一条，@ 确认人，方便手机上看到推送；有失败的带「重发失败的」按钮
-        text = summary_text(site, p.get("disp", ""), targets, user, started)
+        text = summary_text(site, p.get("disp", ""), targets, user, started, probe)
         blocks = _sections(text)
         retry = [t for t in targets if _retryable(t)]
         if retry:
