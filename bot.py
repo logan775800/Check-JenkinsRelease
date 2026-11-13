@@ -930,8 +930,16 @@ def parse_view_cmd(t):
     names, branch, sites = [], None, app.parse_sites(t)
     if not sites:
         return None
+    seen = set()
     for tok in [x for x in re.split(r"[\s,，、；;]+", t) if x]:
-        if app.parse_sites(tok) or tok in ("中台", "非中台"):
+        code = app.parse_sites(tok)
+        if code:
+            # 11-13：新站分支名就叫 ar110 → `web ar110 ar110`。同一个站点编号第二次出现 = 分支名
+            if code[0] in seen and branch is None:
+                branch = tok
+            seen.add(code[0])
+            continue
+        if tok in ("中台", "非中台"):
             continue
         name, not_here, _ = app.resolve_component(tok)
         if not_here:
