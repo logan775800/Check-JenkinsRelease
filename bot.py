@@ -670,6 +670,8 @@ def service_table(r):
         s["sites"][x["site"]] = s["sites"].get(x["site"], True) and ok
         if x["state"] in ("VER", "FAIL", "NOVER"):
             s["bad"] = s.get("bad", 0) + 1     # 真有问题才标 ❌；还没发到的只是 ⏳
+        elif x["state"] == "ADHOC":
+            s["adhoc"] = s.get("adhoc", 0) + 1  # 单独发了别的分支：⚠，不算发错
         if ok:
             s["okjobs"] += 1
             if x.get("actual"):
@@ -689,7 +691,7 @@ def service_table(r):
             ver = next(iter(s["shas"]))
         else:
             ver = "%d 个版本" % len(s["shas"])
-        ico = "✅" if ok_site == n_site else ("❌" if s.get("bad") else "⏳")
+        ico = "✅" if ok_site == n_site else ("❌" if s.get("bad") else ("⚠" if s.get("adhoc") else "⏳"))
         lines.append("%s %s %-18s %3d/%-3d站 %3d job  %s" % (ico, _pad(s["name"], 17), br, ok_site, n_site, s["jobs"], ver))
         if len(s["shas"]) > 1:
             # 以「最后一次构建拿到的」为最新（同网页版「代码落后」口径），不是看哪个 SHA 站多：
@@ -700,6 +702,25 @@ def service_table(r):
                          "构建那一刻分支上还没有后来的提交。要不要重发落后的站你定" % (
                              s["name"], newest, len(s["shasites"][newest]), "；".join(old)))
     return lines, warns
+
+
+def _adhoc_builds():
+    """机器人「按视图发 + 临时分支」发成功的构建：{(job, 构建号): 分支}。11-13 之前的记录没有 adhoc 标记，不算。"""
+    out = {}
+    try:
+        with open(RELEASE_LOG, encoding="utf-8") as f:
+            for ln in f:
+                if '"adhoc": true' not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("event") == "result" and r.get("job") and r.get("num") and r.get("branch"):
+                    out[(r["job"], r["num"])] = r["branch"]
+    except FileNotFoundError:
+        pass
+    return out
 
 
 def cmd_progress(channel, force=True):
@@ -721,15 +742,24 @@ def cmd_progress(channel, force=True):
     r = app.run_check(text, d0.strftime("%Y-%m-%d"), days, ["AR000"], False, force, J_USER, J_TOKEN)
     if not r.get("ok"):
         return "算进度失败：" + "；".join(r.get("warnings") or ["没解析出内容"])
+    # 11-13 他定：清单内的站「单独 @ 发了别的分支」→ ⚠ 单独发了 X，和真正发错的 ❌ 分开，不隐藏。
+    # 只认机器人用「按视图发 + 临时分支」触发的那次构建（job+构建号对得上，且拉到的就是那个分支）
+    adhoc = _adhoc_builds()
+    for x in r["rows"]:
+        a = adhoc.get((x.get("job"), x.get("num")))
+        if x["state"] == "VER" and a and x.get("actual") and app.ref_matches(x["actual"], a):
+            x["state"] = "ADHOC"
     by = {}
     for x in r["rows"]:
         if x["state"] == "NOJOB" or not re.match(r"^AR\d+$", x["site"]):
             continue                                     # 「后台构建」那种汇总行不算站点
         s = by.setdefault(x["site"], {"name": x.get("siteName") or "", "n": 0, "ok": 0, "run": 0,
-                                       "miss": [], "bad": [], "last": 0})
+                                       "miss": [], "bad": [], "adhoc": [], "last": 0})
         view = "Admin" if x["comp"] == app.ADMIN_COMP else (x.get("view") or x["comp"])
         s["n"] += 1
-        if x["state"] == "OK":
+        if x["state"] == "ADHOC":
+            s["adhoc"].append("%s 单独发了 `%s`" % (view, app.normalize_ref(x["actual"])))
+        elif x["state"] == "OK":
             s["ok"] += 1
             s["last"] = max(s["last"], x.get("ts") or 0)
         elif x["state"] == "MISS":
@@ -744,8 +774,10 @@ def cmd_progress(channel, force=True):
     svc_lines, sha_warn = service_table(r)
     done = sorted([kv for kv in S if kv[1]["ok"] == kv[1]["n"]], key=lambda kv: -kv[1]["last"])
     bad = [kv for kv in S if kv[1]["bad"]]
-    part = [kv for kv in S if not kv[1]["bad"] and kv[1]["ok"] < kv[1]["n"] and (kv[1]["ok"] or kv[1]["run"])]
-    none = [kv for kv in S if not kv[1]["bad"] and not kv[1]["ok"] and not kv[1]["run"]]
+    adh = [kv for kv in S if not kv[1]["bad"] and kv[1]["adhoc"]]
+    part = [kv for kv in S if not kv[1]["bad"] and not kv[1]["adhoc"] and kv[1]["ok"] < kv[1]["n"]
+            and (kv[1]["ok"] or kv[1]["run"])]
+    none = [kv for kv in S if not kv[1]["bad"] and not kv[1]["adhoc"] and not kv[1]["ok"] and not kv[1]["run"]]
     nm = lambda k, s: "%s %s" % (k, s["name"]) if s["name"] else k
     out = ["*发版进度：全部发完 %d / %d 站*  （时间窗 %s 起 %d 天）" % (len(done), len(S), d0.strftime("%m-%d"), days),
            "判定：每个服务最近一次构建成功 + 实际拉的分支对 → 该站发完",
@@ -756,8 +788,11 @@ def cmd_progress(channel, force=True):
         out.append("\n✅ *全部发完（%d）*" % len(done))
         out.append("　" + "　".join("%s(%s)" % (k, fmt_ts(s["last"])[6:]) for k, s in done))
     if bad:
-        out.append("\n⚠ *有问题（%d）*" % len(bad))
+        out.append("\n❌ *有问题（%d）*" % len(bad))
         out += ["• %s：%s" % (nm(k, s), "、".join(s["bad"])) for k, s in bad]
+    if adh:
+        out.append("\n⚠ *单独发了别的分支（%d）*  不是本次发版分支；是你有意单独发的就不用管" % len(adh))
+        out += ["• %s：%s" % (nm(k, s), "、".join(s["adhoc"])) for k, s in adh]
     if part:
         out.append("\n⏳ *发了一部分（%d）*" % len(part))
         out += ["• %s %d/%d，缺 %s" % (nm(k, s), s["ok"], s["n"], "、".join(s["miss"])) for k, s in part]
@@ -1031,6 +1066,7 @@ def cmd_plan(channel, text, thread, say, view=None):
         if vbranch:
             p["head"] += "\n_只发：%s · 临时指定分支 `%s`（不改服务清单）_" % (
                 "、".join(_view_name(n) for n, _ in names), vbranch)
+            p["adhoc"] = True                 # 看板据此把「清单内的站单独发了别的分支」标 ⚠ 而不是 ❌
         elif names:
             p["head"] += "\n_只发：%s · %s_" % (
                 "、".join(_view_name(n) for n, _ in names),
@@ -1125,7 +1161,8 @@ def _persist(p, user, started, targets):
     with _state_lock:
         STATE.setdefault("running", {})[p["site"]] = {
             "site": p["site"], "disp": p.get("disp", ""), "channel": p["channel"], "ts": p["ts"],
-            "thread": p.get("thread"), "user": user, "started": started, "targets": targets}
+            "thread": p.get("thread"), "user": user, "started": started, "targets": targets,
+            "adhoc": bool(p.get("adhoc"))}
         save_state(STATE)
 
 
@@ -1455,7 +1492,8 @@ def run_release(p, user, client, resume=None):
             b = t.get("build") or {}
             rlog(event="result", site=site, job=t["job"], view="Admin" if t["which"] == ADMIN else t["view"],
                  num=t.get("num"), result=b.get("result") or t.get("state"), verdict=_verdict(t)[2],
-                 branch=t.get("admin_ver") or b.get("got") or b.get("want"), sha=b.get("sha"), user=user)
+                 branch=t.get("admin_ver") or b.get("got") or b.get("want"), sha=b.get("sha"), user=user,
+                 adhoc=bool(p.get("adhoc")))
         refresh_board(channel)                   # 看板原地更新（没开过看板就什么都不做）
     except Exception as e:
         log.exception("run_release failed")
@@ -1471,7 +1509,8 @@ def run_release(p, user, client, resume=None):
 def resume_all(client):
     """机器人启动时接着跟踪重启前没发完的站点。"""
     for site, r in list((STATE.get("running") or {}).items()):
-        p = {"site": site, "disp": r.get("disp", ""), "channel": r["channel"], "ts": r["ts"], "thread": r.get("thread")}
+        p = {"site": site, "disp": r.get("disp", ""), "channel": r["channel"], "ts": r["ts"], "thread": r.get("thread"),
+             "adhoc": r.get("adhoc", False)}
         with _plans_lock:
             RUNNING.add(site)
         try:
