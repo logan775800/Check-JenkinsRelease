@@ -1020,6 +1020,7 @@ def cmd_plan(channel, text, thread, say, view=None):
     # （10-17 他把「沿用」去掉了：每次发版都重发清单）。
     stale = used_list and time.time() - ch.get("at", 0) > STALE_SERVICES
     jobs = None
+    ready, blocked = [], []                   # 多站时汇总「全部确认」用
     for s in sites:                           # 一个站一条消息、一组按钮，各确认各的
         if s in RUNNING:                      # 正在发的站：直接给当前进度，不出新计划
             say(text=running_status(s), thread_ts=thread)
@@ -1046,6 +1047,30 @@ def cmd_plan(channel, text, thread, say, view=None):
             PLANS[pid] = p
         r = say(text=plan_text(p), blocks=plan_blocks(p, pid), thread_ts=thread)
         p["ts"] = r.get("ts") if r else None
+        if p["targets"] and not p["extra"]:
+            ready.append((pid, p))
+        else:
+            blocked.append(s)
+    # 11-13 他要的：一条消息多个站（如 web-pages 重发几个站）一个个点太慢 → 末尾给「全部确认」
+    if len(ready) >= 2:
+        lines = ["*%d 个站的计划都没问题，可以一起确认*" % len(ready)]
+        lines += ["• %s %s　%d 个 job" % (p["site"], p.get("disp", ""), len(p["targets"])) for _, p in ready]
+        if blocked:
+            lines.append("_不含 %s（计划里有 ❓/⚠ 或没有可发的 job，单独处理）_" % "、".join(blocked))
+        val = ",".join("%s:%s" % (pid, p["site"]) for pid, p in ready)   # 带站点名：已单独点过的也能说清是哪个站
+        detail = "\n".join("%s：%d 个 job" % (p["site"], len(p["targets"])) for _, p in ready)
+        blocks = _sections("\n".join(lines)) + [{"type": "actions", "elements": [
+            {"type": "button", "action_id": "confirm_all", "style": "primary", "value": val,
+             "text": {"type": "plain_text", "text": "全部确认发布（%d 个站）" % len(ready)},
+             "confirm": {"title": {"type": "plain_text", "text": "全部确认发布"},
+                         "text": {"type": "mrkdwn", "text": "一起触发这 %d 个站？\n%s" % (len(ready), detail)},
+                         "confirm": {"type": "plain_text", "text": "全部发布"},
+                         "deny": {"type": "plain_text", "text": "再看看"}}},
+            {"type": "button", "action_id": "cancel_all", "value": val,
+             "text": {"type": "plain_text", "text": "全部取消"}}]},
+            {"type": "context", "elements": [{"type": "mrkdwn",
+             "text": "上面每个站的按钮也还能单独点；点过的站不会被重复触发。15 分钟内有效。"}]}]
+        say(text="\n".join(lines), blocks=blocks, thread_ts=thread)
 
 
 # ---------------------------------------------------------------- 发布
@@ -1457,6 +1482,25 @@ def resume_all(client):
         threading.Thread(target=run_release, args=(p, r["user"], client, r), daemon=True).start()
 
 
+def _start_plan(pid, user, ch, client, msg_ts=None):
+    """确认一份计划并开始发布。返回 None=已开始；否则返回没开始的原因（给人看的）。
+    单站「确认」和多站「全部确认」都走这里：失效/同站并发/点过即摘 的规则只有一份。"""
+    with _plans_lock:
+        p = PLANS.get(pid)
+        if not p or time.time() - p["at"] > PLAN_TTL:
+            PLANS.pop(pid, None)
+            return "%s 的计划已失效（超过 15 分钟、已确认过、或机器人重启过），请重新 @jenkins-bot %s" % (
+                (p["site"],) * 2 if p else ("这个站", "站点编号"))
+        if p["site"] in RUNNING:
+            return "%s 正在发布中，等这次结束再来。" % p["site"]
+        PLANS.pop(pid)                 # 先摘掉：连点两下 / 单站和全部确认各点一次，都不会触发两遍
+        RUNNING.add(p["site"])
+        if msg_ts:
+            p["ts"] = msg_ts
+    _run_confirmed(p, user, ch, client)
+    return None
+
+
 @bolt.action("confirm")
 def on_confirm(ack, body, client):
     ack()
@@ -1466,20 +1510,52 @@ def on_confirm(ack, body, client):
     if user not in ALLOWED:
         client.chat_postEphemeral(channel=ch, user=user, text="你没有发布权限，这个按钮只对授权的人有效。")
         return
+    why = _start_plan(pid, user, ch, client, body["message"]["ts"])
+    if why:
+        client.chat_postEphemeral(channel=ch, user=user, text=why)
+
+
+@bolt.action("confirm_all")
+def on_confirm_all(ack, body, client):
+    ack()
+    user = body["user"]["id"]
+    ch = body["channel"]["id"]
+    if user not in ALLOWED:
+        client.chat_postEphemeral(channel=ch, user=user, text="你没有发布权限，这个按钮只对授权的人有效。")
+        return
+    started, failed = [], []
+    for item in body["actions"][0]["value"].split(","):
+        pid, _, site = item.partition(":")
+        if pid not in PLANS:
+            failed.append("%s：已经单独确认过（或计划已失效），没有重复触发" % site)
+            continue
+        why = _start_plan(pid, user, ch, client)
+        (failed.append(why) if why else started.append(site))
+    txt = "已全部确认：%s 开始发布，各站进度和结论在各自的计划消息里。" % "、".join(started) if started else "一个都没开始。"
+    if failed:
+        txt += "\n没开始的：\n" + "\n".join("• " + w for w in failed)
+    client.chat_update(channel=ch, ts=body["message"]["ts"], text=txt, blocks=_sections(txt))
+
+
+@bolt.action("cancel_all")
+def on_cancel_all(ack, body, client):
+    ack()
+    sites = []
     with _plans_lock:
-        p = PLANS.get(pid)
-        if not p or time.time() - p["at"] > PLAN_TTL:
-            PLANS.pop(pid, None)
-            msg = "这份计划已失效（超过 15 分钟、已确认过、或机器人重启过），请重新 @jenkins-bot %s" % (
-                p["site"] if p else "站点编号")
-            client.chat_postEphemeral(channel=ch, user=user, text=msg)
-            return
-        if p["site"] in RUNNING:
-            client.chat_postEphemeral(channel=ch, user=user, text="%s 正在发布中，等这次结束再来。" % p["site"])
-            return
-        PLANS.pop(pid)                 # 先摘掉：连点两下不会触发两遍
-        RUNNING.add(p["site"])
-        p["ts"] = body["message"]["ts"]
+        for item in body["actions"][0]["value"].split(","):
+            p = PLANS.pop(item.partition(":")[0], None)
+            if p:
+                sites.append(p["site"])
+                try:
+                    client.chat_update(channel=body["channel"]["id"], ts=p["ts"], text="已取消 %s" % p["site"],
+                                       blocks=_sections("~%s~\n已取消，没有触发任何构建。" % p["head"]))
+                except Exception:
+                    log.exception("cancel_all update failed")
+    txt = "已全部取消%s，没有触发任何构建。" % (("：" + "、".join(sites)) if sites else "")
+    client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=txt, blocks=_sections(txt))
+
+
+def _run_confirmed(p, user, ch, client):
     if p.get("summary"):
         # 重发：结论消息保留原样（只去掉按钮），进度另起一条消息，别把结论覆盖掉
         try:
