@@ -110,6 +110,8 @@ COMPONENT_ALIAS = {
     "webagent": "Web", "agentweb": "Web",
     # 发布单有时写中文「代理后台」= Agent_Web 视图（组件 Web）。不能归到 NOT_IN_JENKINS 的「后台」
     "代理后台": "Web", "代理前端": "Web", "代理web": "Web",
+    # 11-13 Logan 确认：这两个写法也是 Agent_Web
+    "代理后台b端": "Web", "agent后台": "Web",
     "thirdapi": "ThirdApi",
     "thirdjob": "ThirdJob",
     # RebateJob：没有分支参数，分支写死在流水线里（10-21 实查 78 个全是 master）
