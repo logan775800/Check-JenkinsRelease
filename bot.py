@@ -927,16 +927,18 @@ def parse_view_cmd(t):
     返回 (视图[(组件名, 写法)], 站点, 分支或None)；不是这种写法返回 None；视图名不在这套 Jenkins 返回错误文本。
     只认精确别名（不做近似匹配）：认错一个视图就是发错服务。
     """
-    names, branch, sites = [], None, app.parse_sites(t)
+    names, sites = [], app.parse_sites(t)
     if not sites:
         return None
-    seen = set()
+    # 带箭头/冒号的是贴发布单（服务清单），不是按视图发，交给原来的逻辑
+    if re.search(r"→|->|=>|➔|⇒|➜|[:：]", t):
+        return None
+    seen, dup, others = set(), [], []
     for tok in [x for x in re.split(r"[\s,，、；;]+", t) if x]:
         code = app.parse_sites(tok)
         if code:
-            # 11-13：新站分支名就叫 ar110 → `web ar110 ar110`。同一个站点编号第二次出现 = 分支名
-            if code[0] in seen and branch is None:
-                branch = tok
+            if code[0] in seen:
+                dup.append(tok)
             seen.add(code[0])
             continue
         if tok in ("中台", "非中台"):
@@ -947,11 +949,22 @@ def parse_view_cmd(t):
         if name:
             if name not in [n for n, _ in names]:
                 names.append((name, tok))
-        elif branch is None and re.search(r"[A-Za-z0-9]", tok):
-            branch = tok
         else:
-            return None                       # 认不出的词：不当成按视图发，交给原来的逻辑
-    return (names, sites, branch) if names else None
+            others.append(tok)
+    if not names:
+        return None
+    # 11-13 事故：写了视图名但没解析成功时退回「按服务清单发全部服务」——他要发 Web-Pages，计划里出了 8 个服务。
+    # 写了视图名就一定是按视图发：看不懂就拒绝，绝不退回全部服务。
+    if len(others) > 1:
+        return ("没看懂：按视图发只能写一个分支，这里多出了 %s。\n写法：`@jenkins-bot web ar107 ar108 feature/v3-uat`"
+                "（视图 + 站点 + 可选一个分支）" % "、".join("`%s`" % x for x in others))
+    branch = others[0] if others else None
+    if branch is None and dup:
+        # 新站分支名就叫 ar110 → `web ar110 ar110`：没写别的分支时，重复出现的站点编号 = 分支名
+        if len(dup) > 1:
+            return "没看懂：%s 重复出现了，分不清哪个是分支。站点编号别重复写" % "、".join(dup)
+        branch = dup[0]
+    return (names, sites, branch)
 
 
 def _view_name(n):
