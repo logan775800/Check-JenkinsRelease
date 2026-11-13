@@ -1381,6 +1381,9 @@ def run_release(p, user, client, resume=None):
             if not ADMIN_PROBE:
                 # 检测关掉（BOT_ADMIN_PROBE 为空）就整段不做，结论里也不出 🌐 行
                 raise _ProbeOff()
+            if not any(t["which"] == ADMIN for t in targets):
+                # 11-13 Logan：只有这次发了 Admin 才检查后台；只发 Web-Pages 等其它服务的不查
+                raise _ProbeOff()
             probe = admin_probe(site)
             if probe[0] == "bad":
                 why = "；".join(x.get("why", "") for x in probe[1] if x.get("verdict") == "bad")
