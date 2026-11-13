@@ -55,6 +55,10 @@ RUN_TIMEOUT = 40 * 60       # 单个站点发布最长等多久，超了报「�
 # 后台前面的 Cloudflare 只放白名单 IP，机器人这台不在里面 → 经反向隧道借 Logan 固定 IP 电脑上的
 # tools/admin_probe_agent.py 去访问。空字符串 = 关掉检测。
 ADMIN_PROBE = os.environ.get("BOT_ADMIN_PROBE", "http://127.0.0.1:18765")
+class _ProbeOff(Exception):
+    """BOT_ADMIN_PROBE 为空 = 后台检查关闭，发完直接出结论。"""
+
+
 PROBE_TRIES, PROBE_GAP = 3, 20  # 刚部署完 IIS 要预热，不正常就隔 20 秒再看，最多 3 次
 
 # BOT_OFFLINE=1：本地测试 handle() 时不去 Slack 校验 token
@@ -1353,6 +1357,9 @@ def run_release(p, user, client, resume=None):
         # 3b. 发完检查后台能不能打开；Admin 部署「成功」但后台崩了 → Admin 改判失败，进重发
         probe = None
         try:
+            if not ADMIN_PROBE:
+                # 检测关掉（BOT_ADMIN_PROBE 为空）就整段不做，结论里也不出 🌐 行
+                raise _ProbeOff()
             probe = admin_probe(site)
             if probe[0] == "bad":
                 why = "；".join(x.get("why", "") for x in probe[1] if x.get("verdict") == "bad")
@@ -1362,6 +1369,8 @@ def run_release(p, user, client, resume=None):
                         t["probe_bad"] = why or "打不开"
             rlog(event="admin_probe", site=site, status=probe[0], error=probe[2] or None,
                  results=[{k: x.get(k) for k in ("url", "verdict", "why", "code")} for x in probe[1]])
+        except _ProbeOff:
+            probe = None
         except Exception as e:
             log.exception("admin probe failed")
             probe = ("unavailable", [], "%s: %s" % (type(e).__name__, str(e)[:120]))

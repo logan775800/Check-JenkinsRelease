@@ -65,6 +65,8 @@ services:
       # 和群里 release 机器人一致；网页版仍用 .env 里的 TZ。
       TZ: "${BOT_TZ:-Asia/Dubai}"
       BOT_STATE: /state/state.json
+      # 11-13 Logan：后台域名换了，暂停发完检查后台；拿到新后台域名清单后删掉这行（恢复默认隧道地址）
+      BOT_ADMIN_PROBE: ""
     volumes:
       - /data/release-bot/state:/state
     logging:
