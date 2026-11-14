@@ -1154,7 +1154,7 @@ def _verdict(t):
     if t.get("probe_bad"):
         return "❌", "部署成功但后台打不开：%s" % t["probe_bad"], "bad"
     if t.get("fe_bad"):
-        return "❌", "部署成功但页面会加载失败（黑屏/白屏），详情见结论 🖥 行", "bad"
+        return "❌", "部署成功但页面会加载失败，见 🖥 行", "bad"
     if t.get("admin_note"):
         return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
@@ -1312,34 +1312,36 @@ def pages_probe(t):
 def fe_lines(targets):
     """结论里「前端检查」那几行。"""
     out = []
+    many = len([t for t in targets if t.get("fe")]) > 1      # AR013 这种一站两个 Pages 才写 job 名
     for t in targets:
         r = t.get("fe")
         if not r:
             continue
-        name = t["job"]
-        url = r.get("url") or ""
+        name = (" `%s`" % t["job"]) if many else ""
         v = r.get("verdict")
         if v == "unknown":
-            out.append("🖥 前端 ❓ `%s` 检查做不了：%s，请手动打开测试域名看一眼" % (name, r.get("why", "")))
-            continue
-        live = {True: "已上线", False: "⚠ 项目主地址还不是这一版", None: ""}[r.get("live")]
-        if v == "ok":
-            out.append("🖥 前端 ✅ `%s` 页面资源完整（%d 个 JS）%s  %s" % (name, r.get("js", 0), live, url))
+            out.append("🖥 前端%s ❓ 没查成（%s），请手动打开看一眼" % (name, r.get("why", "")))
+        elif v == "ok":
+            out.append("🖥 前端%s ✅ 正常%s" % (name, "" if r.get("live") is not False else "（⚠ 线上还不是这一版）"))
         else:
-            out.append("🖥 前端 ❌ `%s` 有文件加载失败，打开可能黑屏/白屏  %s" % (name, url))
-            for x in r["new"][:3]:
-                out.append("   ↳ 这次新引入：%s" % x)
-            for x in r["known"][:3]:
-                out.append("   ↳ 上一版就有、还没修：%s" % x)
+            # 他嫌啰嗦（11-14）：一行结论 + 一行问题 + 一行回滚，明细只留第一条
+            out.append("🖥 前端%s ❌ 打开会黑屏/白屏  %s" % (name, r.get("url") or ""))
+            out.append("   ↳ %s%s" % (_short_problem((r["new"] + r["known"])[0]),
+                                       "" if r["new"] else "（上一版就有）"))
             if r.get("baseline"):
-                out.append("   ↳ 最后一个正常版本：%s（Jenkins #%s）。要回滚 → CF Pages 后台该部署「⋯」→ Rollback"
-                           % (r["baseline"], r.get("baseline_num") or "?"))
-            else:
-                out.append("   ↳ 往前没找到检查通过的版本（Jenkins 只留最近几次构建）")
-            if r.get("live"):
-                out.append("   ↳ ⚠ 这一版已经是线上版本，用户现在打开就是坏的")
-            out.append("   ↳ 重发同样代码还是坏的，要前端修代码或回滚")
+                out.append("   ↳ 可回滚到 #%s %s" % (r.get("baseline_num") or "?", r["baseline"]))
     return out
+
+
+def _short_problem(x):
+    """引用没打包进去:"@/assets/.../headerMessage.png" 在 js/okwinHome2-C7B5Vv8A.js → okwinHome2 引用的 headerMessage.png 没打包进去"""
+    m = re.match(r'引用没打包进去:"([^"]+)" 在 (?:js/)?([^/]+?)(?:-[A-Za-z0-9_\-]{8})?\.js$', x)
+    if m:
+        return "%s 引用的 %s 没打包进去" % (m.group(2), m.group(1).rsplit("/", 1)[-1])
+    m = re.match(r"(缺文件\(HTTP \d+\)|文件不存在\(返回的是 [^)]*\)):(\S+)", x)
+    if m:
+        return "%s 缺失" % m.group(2).rsplit("/", 1)[-1]
+    return x
 
 
 def retry_blocks(rp, pid):
