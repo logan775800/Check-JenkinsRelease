@@ -586,14 +586,25 @@ _MULTI_LINE = re.compile(
 # 分组之间的分隔符。半角 / 必须两边带空格才算分隔 —— 分支名本身就带 /（feature/v3）；
 # 全角 ／ ｜ 不会出现在分支名里，怎么写都算（10-16 真实发布单用的就是全角 ／）
 _MULTI_SEP = re.compile(r"\s+/\s+|\s*[／｜]\s*|[；;、，,|]")
-_MULTI_PART = re.compile(r"^(?P<label>[^\s:：]+?)\s*[:：]?\s*(?P<val>\S+)$")
+# 值里不许有冒号：11-14 真实发布单「非中台：uat / 中台：feature/v3-uat」，旧写法 val=\S+
+# 加上 label 最短匹配，被切成 label「非」+ val「中台：uat」→ 分组对不上任何站，Pages 整个没发。
+_MULTI_PART = re.compile(r"^(?P<label>[^\s:：]+?)\s*[:：]?\s*(?P<val>[^\s:：]+)$")
+# 不写分隔符、只靠冒号隔开的「非中台：uat  中台：feature/v3-uat」（11-14 同一天也出现过）
+_MULTI_COLON_PAIRS = re.compile(r"^(?:[^\s:：]+\s*[:：]\s*[^\s:：]+\s*){2,}$")
+_COLON_PAIR = re.compile(r"([^\s:：]+)\s*[:：]\s*([^\s:：]+)")
 
 
 def parse_multi(rest):
     """「非中台 uat / 中台 v3-uat」-> [(group, site, val), ...]；有一段看不懂就整体返回 None。"""
     out = []
+    parts = []
     for part in _MULTI_SEP.split(rest):
         part = part.strip()
+        if _MULTI_COLON_PAIRS.match(part):
+            parts += ["%s：%s" % p for p in _COLON_PAIR.findall(part)]
+        else:
+            parts.append(part)
+    for part in parts:
         if not part:
             continue
         m = _MULTI_PART.match(part)
