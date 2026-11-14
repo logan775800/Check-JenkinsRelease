@@ -443,7 +443,7 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 　 不点也行：全站发完的结论下面还有 *重发失败的* 按钮（这时前面那些单个按钮自动作废，免得发两遍）；都是 15 分钟内有效
 • 报错是 `MSB4166 Child node exited prematurely` → 编译进程中途退出，不是代码错误（日志里 0 Error），部署也没执行，重发即可
 • 每个站发完自动打开本站后台地址检查：崩了（服务器错误/打不开）→ Admin 判 ❌ 并给重发按钮；结论里 🌐 那行就是检查结果
-• 发了 Web-Pages 的站自动检查前端：把这次部署的 JS 全部走一遍，有文件缺失/引用没打包进去（打开会黑屏白屏）→ Web-Pages 判 ❌，给出最后一个正常版本方便回滚；结论里 🖥 那行就是检查结果。这种重发没用，要前端修代码
+• 发了 Web-Pages 的站自动检查前端：把这次部署的 JS 全部走一遍，有文件缺失/引用没打包进去（打开会黑屏白屏）→ Web-Pages 判 ❌，给出最后一个正常版本方便回滚；结论里 🌐 前端 那行就是检查结果。这种重发没用，要前端修代码
 
 *五、规则*
 • 只有授权的人点「确认发布」「重发」才生效；计划 15 分钟内有效，点一次就失效
@@ -1154,7 +1154,7 @@ def _verdict(t):
     if t.get("probe_bad"):
         return "❌", "部署成功但后台打不开：%s" % t["probe_bad"], "bad"
     if t.get("fe_bad"):
-        return "❌", "部署成功但页面会加载失败，见上面「前端访问异常」", "bad"
+        return "❌", "部署成功但页面会加载失败，见上面 🌐 前端", "bad"
     if t.get("admin_note"):
         return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
@@ -1317,16 +1317,18 @@ def fe_lines(targets):
         r = t.get("fe")
         if not r:
             continue
-        # 11-14 他定的叫法：「前端访问正常 / 异常」，一行
+        # 11-14 他定：和后台那行同一格式「🌐 后台 ✅ xx  链接」→「🌐 前端 ✅ 访问页正常  Pages 链接」
         name = ("（%s）" % t["job"]) if many else ""
         v = r.get("verdict")
+        url = r.get("url") or ""
         if v == "unknown":
-            out.append("🖥 前端访问没查成%s（%s），请手动打开看一眼" % (name, r.get("why", "")))
+            out.append("🌐 前端%s ❓ 没查成：%s，请手动打开看一眼  %s" % (name, r.get("why", ""), url))
         elif v == "ok":
-            out.append("🖥 前端访问正常%s%s" % (name, "" if r.get("live") is not False else "（⚠ 线上还不是这一版）"))
+            out.append("🌐 前端%s ✅ 访问页正常%s  %s" % (
+                name, "" if r.get("live") is not False else "（⚠ 线上还不是这一版）", url))
         else:
             # 他嫌啰嗦（11-14）：一行结论 + 一行问题 + 一行回滚，明细只留第一条
-            out.append("🖥 前端访问异常%s：打开会黑屏/白屏  %s" % (name, r.get("url") or ""))
+            out.append("🌐 前端%s ❌ 打开会黑屏/白屏  %s" % (name, url))
             out.append("   ↳ %s%s" % (_short_problem((r["new"] + r["known"])[0]),
                                        "" if r["new"] else "（上一版就有）"))
             if r.get("baseline"):
