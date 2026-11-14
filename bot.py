@@ -1154,7 +1154,7 @@ def _verdict(t):
     if t.get("probe_bad"):
         return "❌", "部署成功但后台打不开：%s" % t["probe_bad"], "bad"
     if t.get("fe_bad"):
-        return "❌", "部署成功但页面会加载失败（黑屏/白屏）：%s" % t["fe_bad"], "bad"
+        return "❌", "部署成功但页面会加载失败（黑屏/白屏），详情见结论 🖥 行", "bad"
     if t.get("admin_note"):
         return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
