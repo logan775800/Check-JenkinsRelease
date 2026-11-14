@@ -35,6 +35,7 @@ import uuid
 from datetime import datetime
 
 import app
+import pages_check
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -60,6 +61,8 @@ class _ProbeOff(Exception):
 
 
 PROBE_TRIES, PROBE_GAP = 3, 20  # 刚部署完 IIS 要预热，不正常就隔 20 秒再看，最多 3 次
+# Web-Pages 发完检查前端产物（11-14 AR064 黑屏：CF success + 全 200，但首页 chunk 引用没打包进去）。"0" 关掉
+PAGES_CHECK = os.environ.get("BOT_PAGES_CHECK", "1") != "0"
 
 # BOT_OFFLINE=1：本地测试 handle() 时不去 Slack 校验 token
 bolt = App(token=os.environ["SLACK_BOT_TOKEN"],
@@ -135,6 +138,15 @@ def console_errors(which, job, num, max_err=8, tail=3, max_bytes=8 * 1024 * 1024
     if not errs:                                  # 没认出报错行就退回看尾巴
         return [ln[:300] for ln in lines[-20:]]
     return errs + (["…"] if last else []) + last
+
+
+def console_text(which, job, num, max_bytes=8 * 1024 * 1024):
+    base, u, t = _cred(which)
+    req = urllib.request.Request(base + "/job/%s/%s/consoleText" % (q(job), num))
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{u}:{t}".encode()).decode())
+    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JenkinsReleaseBot/1.0")
+    with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r:
+        return _ANSI.sub("", r.read(max_bytes).decode("utf-8", "replace"))
 
 
 def console_tail(which, job, num, n=20, max_bytes=8 * 1024 * 1024):
@@ -431,6 +443,7 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 　 不点也行：全站发完的结论下面还有 *重发失败的* 按钮（这时前面那些单个按钮自动作废，免得发两遍）；都是 15 分钟内有效
 • 报错是 `MSB4166 Child node exited prematurely` → 编译进程中途退出，不是代码错误（日志里 0 Error），部署也没执行，重发即可
 • 每个站发完自动打开本站后台地址检查：崩了（服务器错误/打不开）→ Admin 判 ❌ 并给重发按钮；结论里 🌐 那行就是检查结果
+• 发了 Web-Pages 的站自动检查前端：把这次部署的 JS 全部走一遍，有文件缺失/引用没打包进去（打开会黑屏白屏）→ Web-Pages 判 ❌，给出最后一个正常版本方便回滚；结论里 🖥 那行就是检查结果。这种重发没用，要前端修代码
 
 *五、规则*
 • 只有授权的人点「确认发布」「重发」才生效；计划 15 分钟内有效，点一次就失效
@@ -1140,6 +1153,8 @@ def _verdict(t):
             return "⚠", "发错：实际参数 `%s`，应为 `%s`" % (want, t["value"]), "wrong"
     if t.get("probe_bad"):
         return "❌", "部署成功但后台打不开：%s" % t["probe_bad"], "bad"
+    if t.get("fe_bad"):
+        return "❌", "部署成功但页面会加载失败（黑屏/白屏）：%s" % t["fe_bad"], "bad"
     if t.get("admin_note"):
         return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
@@ -1250,6 +1265,83 @@ def probe_lines(site, probe, has_admin):
     return out
 
 
+def pages_probe(t):
+    """Web-Pages job 发完：从本次和之前成功构建的日志里取部署地址，交给 pages_check。
+    结果写 t["fe"]；本次新增问题 → t["fe_bad"]（判 ❌，不进重发：同样代码重发还是坏的，要修代码或回滚）。"""
+    txt = console_text(t["which"], t["job"], t["num"])
+    url = pages_check.deploy_url(txt)
+    if not url:
+        t["fe"] = {"verdict": "unknown", "why": "构建日志里没找到部署地址（Deployment complete 那行）"}
+        return
+    prev = []        # [(构建号, 部署地址)] 新→旧
+    try:
+        bl = jget(t["which"], "/job/%s/api/json" % q(t["job"]) + app._q("builds[number,result]{0,12}"))
+        for b in bl.get("builds") or []:
+            if b.get("number", 0) < t["num"] and b.get("result") == "SUCCESS" and len(prev) < 5:
+                u = pages_check.deploy_url(console_text(t["which"], t["job"], b["number"]))
+                if u:
+                    prev.append((b["number"], u))
+    except Exception as e:
+        log.warning("pages prev builds %s: %s", t["job"], e)
+    # Jenkins 只留最近几次构建（AR064 只留 3 次），回滚目标再从机器人自己记的「检查通过」里补
+    try:
+        with open(RELEASE_LOG, encoding="utf-8") as f:
+            oks = [json.loads(ln) for ln in f if '"pages_check"' in ln and t["job"] in ln]
+        for e in reversed(oks):
+            if e.get("job") == t["job"] and e.get("verdict") == "ok" and e.get("url") and \
+                    e.get("num") != t["num"] and e["url"] not in [u for _, u in prev]:
+                prev.append((e.get("num"), e["url"]))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("pages history %s: %s", t["job"], e)
+    r = pages_check.run(url, [u for _, u in prev])
+    if r.get("live") is False:
+        # 主地址偶尔比部署地址晚几秒切过去，再看一次
+        time.sleep(15)
+        a = pages_check.check_entries(pages_check.project_alias(url))
+        c = pages_check.check_entries(url)
+        r["live"] = (set(a) == set(c)) if a is not None and c is not None else None
+    r["baseline_num"] = next((n for n, u in prev if u == r.get("baseline")), None)
+    t["fe"] = r
+    if r["verdict"] == "bad":
+        allp = r["new"] + r["known"]
+        t["fe_bad"] = allp[0] + (" 等 %d 个" % len(allp) if len(allp) > 1 else "")
+
+
+def fe_lines(targets):
+    """结论里「前端检查」那几行。"""
+    out = []
+    for t in targets:
+        r = t.get("fe")
+        if not r:
+            continue
+        name = t["job"]
+        url = r.get("url") or ""
+        v = r.get("verdict")
+        if v == "unknown":
+            out.append("🖥 前端 ❓ `%s` 检查做不了：%s，请手动打开测试域名看一眼" % (name, r.get("why", "")))
+            continue
+        live = {True: "已上线", False: "⚠ 项目主地址还不是这一版", None: ""}[r.get("live")]
+        if v == "ok":
+            out.append("🖥 前端 ✅ `%s` 页面资源完整（%d 个 JS）%s  %s" % (name, r.get("js", 0), live, url))
+        else:
+            out.append("🖥 前端 ❌ `%s` 有文件加载失败，打开可能黑屏/白屏  %s" % (name, url))
+            for x in r["new"][:3]:
+                out.append("   ↳ 这次新引入：%s" % x)
+            for x in r["known"][:3]:
+                out.append("   ↳ 上一版就有、还没修：%s" % x)
+            if r.get("baseline"):
+                out.append("   ↳ 最后一个正常版本：%s（Jenkins #%s）。要回滚 → CF Pages 后台该部署「⋯」→ Rollback"
+                           % (r["baseline"], r.get("baseline_num") or "?"))
+            else:
+                out.append("   ↳ 往前没找到检查通过的版本（Jenkins 只留最近几次构建）")
+            if r.get("live"):
+                out.append("   ↳ ⚠ 这一版已经是线上版本，用户现在打开就是坏的")
+            out.append("   ↳ 重发同样代码还是坏的，要前端修代码或回滚")
+    return out
+
+
 def retry_blocks(rp, pid):
     names = "、".join(t["view"] for t in rp["targets"])
     return [{"type": "actions", "elements": [
@@ -1313,6 +1405,7 @@ def summary_text(site, disp, targets, user, started, probe=None):
             fmt_ts(_end_ts(t)) if t.get("build") else "—", b.get("sha") or ""))
     lines = [title, "```" + "\n".join(rows) + "```"]
     lines += probe_lines(site, probe, any(t["which"] == ADMIN for t in targets))
+    lines += fe_lines(targets)
     for k in ("bad", "wrong", "skip"):
         lines += [_line(t) for t in cats.get(k, [])]
     lines.append("用时 %d 分钟（%s 起）。可以接着 @我 下一个站。" % (
@@ -1523,6 +1616,20 @@ def run_release(p, user, client, resume=None):
         except Exception as e:
             log.exception("admin probe failed")
             probe = ("unavailable", [], "%s: %s" % (type(e).__name__, str(e)[:120]))
+        # 3c. Web-Pages 发完检查前端产物；Jenkins/CF 都报成功也可能黑屏（11-14 AR064）
+        if PAGES_CHECK:
+            for t in targets:
+                if t["which"] == AR and t["view"] == "Web-Pages" and t.get("state") == "done" and \
+                        (t.get("build") or {}).get("result") == "SUCCESS" and t.get("num"):
+                    try:
+                        pages_probe(t)
+                    except Exception as e:
+                        log.exception("pages check %s", t["job"])
+                        t["fe"] = {"verdict": "unknown", "why": "%s: %s" % (type(e).__name__, str(e)[:120])}
+                    fe = t.get("fe") or {}
+                    rlog(event="pages_check", site=site, job=t["job"], num=t.get("num"), verdict=fe.get("verdict"),
+                         url=fe.get("url"), new=fe.get("new"), known=fe.get("known"), live=fe.get("live"),
+                         baseline=fe.get("baseline"), why=fe.get("why"))
         render(final=True)
         # 4a. 构建失败的附日志最后几行：多数时候看这几行就知道原因，省得点进 Jenkins 翻
         #     跟踪中已经马上贴过的（early_posted）不再贴第二遍

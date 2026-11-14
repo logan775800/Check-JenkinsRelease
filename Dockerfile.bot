@@ -3,7 +3,7 @@
 FROM python:3.12-alpine
 RUN apk add --no-cache tzdata && pip install --no-cache-dir "slack_bolt>=1.18,<2"
 WORKDIR /app
-COPY app.py bot.py /app/
+COPY app.py bot.py pages_check.py /app/
 RUN adduser -D -H -u 10001 appuser
 USER appuser
 ENV TZ=UTC PYTHONUNBUFFERED=1
