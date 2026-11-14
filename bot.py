@@ -1154,7 +1154,7 @@ def _verdict(t):
     if t.get("probe_bad"):
         return "❌", "部署成功但后台打不开：%s" % t["probe_bad"], "bad"
     if t.get("fe_bad"):
-        return "❌", "部署成功但页面会加载失败，见 🖥 行", "bad"
+        return "❌", "部署成功但页面会加载失败，见上面「前端访问异常」", "bad"
     if t.get("admin_note"):
         return "✅", "成功（%s）" % t["admin_note"], "ok"
     return "✅", "成功 %s" % (b.get("sha") or ""), "ok"
@@ -1317,15 +1317,16 @@ def fe_lines(targets):
         r = t.get("fe")
         if not r:
             continue
-        name = (" `%s`" % t["job"]) if many else ""
+        # 11-14 他定的叫法：「前端访问正常 / 异常」，一行
+        name = ("（%s）" % t["job"]) if many else ""
         v = r.get("verdict")
         if v == "unknown":
-            out.append("🖥 前端%s ❓ 没查成（%s），请手动打开看一眼" % (name, r.get("why", "")))
+            out.append("🖥 前端访问没查成%s（%s），请手动打开看一眼" % (name, r.get("why", "")))
         elif v == "ok":
-            out.append("🖥 前端%s ✅ 正常%s" % (name, "" if r.get("live") is not False else "（⚠ 线上还不是这一版）"))
+            out.append("🖥 前端访问正常%s%s" % (name, "" if r.get("live") is not False else "（⚠ 线上还不是这一版）"))
         else:
             # 他嫌啰嗦（11-14）：一行结论 + 一行问题 + 一行回滚，明细只留第一条
-            out.append("🖥 前端%s ❌ 打开会黑屏/白屏  %s" % (name, r.get("url") or ""))
+            out.append("🖥 前端访问异常%s：打开会黑屏/白屏  %s" % (name, r.get("url") or ""))
             out.append("   ↳ %s%s" % (_short_problem((r["new"] + r["known"])[0]),
                                        "" if r["new"] else "（上一版就有）"))
             if r.get("baseline"):
