@@ -87,6 +87,7 @@ def save_state(st):
 STATE = load_state()
 PLANS = {}                  # plan_id -> 计划（只在内存：机器人重启后旧按钮自然失效）
 RUNNING = set()             # 正在发布的站点，防止同一站点并发两次
+LIVE = {}                   # 站点 -> 正在跟踪的 targets（「马上重发」把失败的 job 塞回这一轮，由 run_release 重新触发+跟踪）
 _plans_lock = threading.Lock()
 
 # ---------------------------------------------------------------- Jenkins 访问
@@ -393,11 +394,12 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 
 *一、整轮发版*  （多个站、每个站发全部服务）
 1. 记服务清单（每次发版先发一次）：`@jenkins-bot 服务` 换行贴「服务 → 分支」几行
-　 例：`Web → 分支：非中台 uat ／ 中台 feature/v3-uat` ；整份发布单贴进来也行，站点清单和分组会一起记住
+　 例：`Web → 分支：非中台 uat ／ 中台 feature/v3-uat` （`非中台：uat / 中台：feature/v3-uat` 这样带冒号也行）；整份发布单贴进来也行，站点清单和分组会一起记住
+　 贴完看机器人回的「已记下」：Web-Pages 应该是 *（非中台）uat* 和 *（中台）feature/v3-uat* 两条，分组名不对就别往下发
 2. 记站点清单：`@jenkins-bot 站点` 换行贴站点清单（带「中台站 / 非中台站」标题）
 　 → 频道里出一条 📋 发版看板，发布中每 60 秒自动刷新
 3. 发某个站（全部服务）：`@jenkins-bot ar107` ；一次最多 5 个站：`@jenkins-bot ar107 ar108`
-4. 机器人回发布计划 → 核对视图和分支 → 点 *确认发布*
+4. 机器人回发布计划 → 核对视图和分支 → 点 *确认发布* （一次 @ 多个站时末尾有 *全部确认发布* ）
 5. 发完线程里回结论表（每个服务的实际分支、构建号、时间、代码版本）→ 接着 @ 下一个站
 
 *二、单独发某个视图*  （临时需求；写法：视图名 + 站点 + 分支，分支只这一次有效，不改服务清单）
@@ -425,7 +427,9 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 • 机器人问站点是中台还是非中台 → `@jenkins-bot ar107 中台` （会记住）
 • 计划没有确认按钮 → 看计划里的 ❓/⚠：分组未知、服务清单超过 12 小时没更新（重发服务清单）、找不到 job
 • 站点正在发布时再 @ 它 → 直接回当前进度，不会重复发
-• 构建失败 → 线程里附报错行，结论下面有 *重发失败的* 按钮（15 分钟内有效）
+• 构建失败 → *马上* 在线程里贴报错行 + *重发 XX* 按钮，不用等同站其它 job 跑完；点了就在原计划消息里重新跟踪
+　 不点也行：全站发完的结论下面还有 *重发失败的* 按钮（这时前面那些单个按钮自动作废，免得发两遍）；都是 15 分钟内有效
+• 报错是 `MSB4166 Child node exited prematurely` → 编译进程中途退出，不是代码错误（日志里 0 Error），部署也没执行，重发即可
 • 每个站发完自动打开本站后台地址检查：崩了（服务器错误/打不开）→ Admin 判 ❌ 并给重发按钮；结论里 🌐 那行就是检查结果
 
 *五、规则*
@@ -1147,8 +1151,8 @@ def _line(t):
     st = t.get("state")
     if st == "wait_admin":
         return "⏸ *%s* `%s` 等打包：%s" % (t["view"], t["job"], t.get("why") or "检查 build_admin…")
-    if st in ("queued", "triggering"):
-        return "⏸ *%s* `%s` 排队中…" % (t["view"], t["job"])
+    if st in ("queued", "triggering", "retry_req"):
+        return "⏸ *%s* `%s` %s排队中…" % (t["view"], t["job"], "重发 " if t.get("retried") else "")
     if st == "running":
         return "⏳ *%s* `%s` %s 构建中…" % (t["view"], t["job"], num)
     ico, txt, _ = _verdict(t)
@@ -1259,6 +1263,28 @@ def retry_blocks(rp, pid):
                  "text": {"type": "plain_text", "text": "不重发"}}]},
             {"type": "context", "elements": [{"type": "mrkdwn",
              "text": "参数和刚才一样；15 分钟内有效。先看上面的日志确认原因再点。"}]}]
+
+
+def retry_one_blocks(pid, site, t):
+    """11-14 他要的：失败了马上给按钮，不用等同站其它 job 全部跑完。只重发这一个 job。"""
+    return [{"type": "actions", "elements": [
+                {"type": "button", "action_id": "retry_one", "style": "primary", "value": pid,
+                 "text": {"type": "plain_text", "text": "重发 %s" % t["view"]},
+                 "confirm": {"title": {"type": "plain_text", "text": "重发"},
+                             "text": {"type": "mrkdwn", "text": "重新触发 *%s* 的 `%s`？参数和刚才一样" % (site, t["job"])},
+                             "confirm": {"type": "plain_text", "text": "重发"},
+                             "deny": {"type": "plain_text", "text": "先不"}}}]},
+            {"type": "context", "elements": [{"type": "mrkdwn",
+             "text": "同站其它 job 还在跑，不用等它们；15 分钟内有效。不点也行，全站发完的结论下面还会有「重发失败的」按钮。"}]}]
+
+
+def _early_fail(t):
+    """跟踪中就能判定失败、值得马上给重发按钮的 job（后台那套另有打包流程，留到结论里统一处理）。"""
+    if t["which"] == ADMIN:
+        return False
+    st = t.get("state")
+    return st in ("trigger_err", "cancelled") or (
+        st == "done" and (t.get("build") or {}).get("result") not in (None, "SUCCESS"))
 
 
 def summary_text(site, disp, targets, user, started, probe=None):
@@ -1394,13 +1420,44 @@ def run_release(p, user, client, resume=None):
         snap = lambda: [(t["state"], t.get("num"), t.get("why")) for t in targets]
         last = snap()
         q404 = {}
-        while any(t["state"] in ("queued", "running", "wait_admin", "triggering") for t in targets):
-            if time.time() - started > RUN_TIMEOUT:
+        ACTIVE = ("queued", "running", "wait_admin", "triggering", "retry_req")
+        deadline = started + RUN_TIMEOUT
+        thread = p.get("thread") or p["ts"]
+        with _plans_lock:
+            LIVE[site] = targets
+        while True:
+            with _plans_lock:
+                if not any(t["state"] in ACTIVE for t in targets):
+                    # 在锁里摘掉：retry_one 要么赶在这之前把 job 塞回来（本轮接着跟），要么看不到 LIVE 走单独发布
+                    LIVE.pop(site, None)
+                    break
+            if time.time() > deadline:
                 for t in targets:
-                    if t["state"] in ("queued", "running", "wait_admin", "triggering"):
+                    if t["state"] in ACTIVE:
                         t["state"] = "timeout"
+                with _plans_lock:
+                    LIVE.pop(site, None)
                 break
             time.sleep(POLL_EVERY)
+            # 3a. 点了「马上重发」的：清掉上次结果重新触发，跟踪时限从现在起重新算
+            for t in targets:
+                if t["state"] == "retry_req":
+                    for k in ("num", "url", "build", "why", "queue", "early_posted"):
+                        t.pop(k, None)
+                    t["retried"] = t.get("retried", 0) + 1
+                    try:
+                        lb = jget(t["which"], "/job/%s/api/json" % q(t["job"]) + app._q("inQueue,lastBuild[building]"))
+                        busy = lb.get("inQueue") or (lb.get("lastBuild") or {}).get("building")
+                    except Exception:
+                        busy = False
+                    if busy:
+                        t.update(state="skip", why="重发前发现它已在构建/排队（可能有人手动点了），没重复触发")
+                        render()
+                        continue
+                    t["state"] = "triggering"
+                    trigger(t)
+                    deadline = max(deadline, time.time() + RUN_TIMEOUT)
+                    render()
             for t in targets:
                 try:
                     if t["state"] == "queued":
@@ -1437,6 +1494,12 @@ def run_release(p, user, client, resume=None):
             if snap() != last:                # 后台线程也会改状态，按快照比
                 render()
                 last = snap()
+            # 3c. 有 job 失败、但同站还有别的在跑：马上贴报错+「重发这个」按钮，不用等全站结束
+            if any(x["state"] in ACTIVE for x in targets):
+                for t in targets:
+                    if _early_fail(t) and not t.get("early_posted"):
+                        t["early_posted"] = True
+                        _post_early_fail(p, site, t, thread, client)
         # 3b. 发完检查后台能不能打开；Admin 部署「成功」但后台崩了 → Admin 改判失败，进重发
         probe = None
         try:
@@ -1461,11 +1524,12 @@ def run_release(p, user, client, resume=None):
             log.exception("admin probe failed")
             probe = ("unavailable", [], "%s: %s" % (type(e).__name__, str(e)[:120]))
         render(final=True)
-        thread = p.get("thread") or p["ts"]
         # 4a. 构建失败的附日志最后几行：多数时候看这几行就知道原因，省得点进 Jenkins 翻
+        #     跟踪中已经马上贴过的（early_posted）不再贴第二遍
         for t in targets:
             b = t.get("build") or {}
-            if t.get("state") == "done" and b.get("result") != "SUCCESS" and t.get("num"):
+            if t.get("state") == "done" and b.get("result") != "SUCCESS" and t.get("num") \
+                    and not t.get("early_posted"):
                 try:
                     lines = console_errors(t["which"], t["job"], t["num"])
                     client.chat_postMessage(channel=channel, thread_ts=thread,
@@ -1477,6 +1541,10 @@ def run_release(p, user, client, resume=None):
         text = summary_text(site, p.get("disp", ""), targets, user, started, probe)
         blocks = _sections(text)
         retry = [t for t in targets if _retryable(t)]
+        with _plans_lock:
+            # 跟踪中贴的「重发 XX」按钮到此作废，统一用结论下面的按钮，免得两个按钮各点一次发两遍
+            for k in [k for k, v in PLANS.items() if v.get("early") and v["site"] == site]:
+                PLANS.pop(k)
         if retry:
             pid = uuid.uuid4().hex[:12]
             rp = {"site": site, "disp": p.get("disp", ""), "channel": channel, "thread": thread,
@@ -1503,7 +1571,29 @@ def run_release(p, user, client, resume=None):
     finally:
         _unpersist(site)
         with _plans_lock:
+            LIVE.pop(site, None)
             RUNNING.discard(site)
+
+
+def _post_early_fail(p, site, t, thread, client):
+    """失败的 job：线程里贴报错行 + 「重发 XX」按钮。"""
+    head = "❌ *%s* `%s` %s" % (t["view"], t["job"], _verdict(t)[1])
+    if t.get("num"):
+        head += " #%s" % t["num"]
+        try:
+            head += "，报错：\n```%s```" % "\n".join(console_errors(t["which"], t["job"], t["num"]))[:3500]
+        except Exception as e:
+            log.warning("console tail %s: %s", t["job"], e)
+    pid = uuid.uuid4().hex[:12]
+    with _plans_lock:
+        PLANS[pid] = {"site": site, "disp": p.get("disp", ""), "channel": p["channel"], "thread": thread,
+                      "at": time.time(), "early": True, "job": t["job"], "head": head,
+                      "targets": [{k: t[k] for k in ("which", "view", "job", "pname", "value") if k in t}]}
+    try:
+        client.chat_postMessage(channel=p["channel"], thread_ts=thread, text=head,
+                                blocks=_sections(head) + retry_one_blocks(pid, site, t))
+    except Exception:
+        log.exception("early fail post %s", t["job"])
 
 
 def resume_all(client):
@@ -1552,6 +1642,51 @@ def on_confirm(ack, body, client):
     why = _start_plan(pid, user, ch, client, body["message"]["ts"])
     if why:
         client.chat_postEphemeral(channel=ch, user=user, text=why)
+
+
+@bolt.action("retry_one")
+def on_retry_one(ack, body, client):
+    """跟踪中「重发 XX」：把这个 job 塞回本站正在跟踪的这一轮，由 run_release 重新触发，结果并进同一份结论。"""
+    ack()
+    user = body["user"]["id"]
+    ch = body["channel"]["id"]
+    if user not in ALLOWED:
+        client.chat_postEphemeral(channel=ch, user=user, text="你没有发布权限，这个按钮只对授权的人有效。")
+        return
+    pid = body["actions"][0]["value"]
+    note = None
+    with _plans_lock:
+        rp = PLANS.get(pid)
+        if not rp or time.time() - rp["at"] > PLAN_TTL:
+            PLANS.pop(pid, None)
+            why = ("这个按钮已失效（超过 15 分钟、已点过、机器人重启过，或这个站已经发完）。"
+                   "站点发完的话用结论下面的「重发失败的」按钮；没有的话重新 @jenkins-bot")
+        else:
+            live = LIVE.get(rp["site"])
+            t = next((x for x in (live or []) if x["job"] == rp["job"]), None)
+            if t is None:
+                why = "%s 这一轮已经在收尾，等结论出来用结论下面的「重发失败的」按钮。" % rp["site"]
+            elif not _early_fail(t):
+                PLANS.pop(pid, None)
+                why = "`%s` 现在不是失败状态（已经重发过或在跑），没有重复触发。" % rp["job"]
+            else:
+                PLANS.pop(pid, None)           # 先摘：连点两下只触发一次
+                t["state"] = "retry_req"
+                why = None
+                note = rp
+    if why:
+        client.chat_postEphemeral(channel=ch, user=user, text=why)
+        return
+    log.info("retry_one %s %s by %s", note["site"], note["job"], user)
+    rlog(event="confirm", site=note["site"], user=user, retry=True, early=True,
+         jobs=["%s %s=%s" % (x["job"], x["pname"], x["value"]) if x.get("pname") else x["job"]
+               for x in note["targets"]])
+    try:
+        client.chat_update(channel=ch, ts=body["message"]["ts"], text=note["head"],
+                           blocks=_sections(note["head"]) + [{"type": "context", "elements": [
+                               {"type": "mrkdwn", "text": "已点重发，进度看上面的计划消息（几秒内变成「重发 排队中」）"}]}])
+    except Exception:
+        log.exception("retry_one update failed")
 
 
 @bolt.action("confirm_all")
