@@ -519,7 +519,7 @@ def cmd_services(channel, text, user):
     if groups:
         out.append("站点分组也记住了：" + "、".join("%s=%s" % kv for kv in sorted(groups.items())))
     if sites:
-        board_async(channel, create=True)
+        board_async(channel, create=True, new_round=True)
         out.append("站点清单也记下了：%d 个站。📋 发版看板已发在频道里，有站点在发布时每分钟自动刷新" % len(sites))
     out += ["⚠ " + w for w in warns]
     return "\n".join(out)
@@ -538,7 +538,7 @@ def cmd_sites(channel, text, user):
     gs = {}
     for s in sites:
         gs.setdefault(groups.get(s) or "未分组", []).append(s)
-    board_async(channel, create=True)          # 新一轮发版：频道里发一条看板，之后有站点在发布时每分钟自动刷新
+    board_async(channel, create=True, new_round=True)          # 新一轮发版：频道里发一条看板，之后有站点在发布时每分钟自动刷新
     return ("已记下这次发版的 %d 个站点（%s）。\n📋 发版看板已发在频道里，有站点在发布时每分钟自动刷新；"
             "也可以随时 `@jenkins-bot 进度`。" % (len(sites), "、".join("%s %d" % (g, len(v)) for g, v in gs.items())))
 
@@ -549,7 +549,7 @@ _board_busy = set()                 # 正在刷新的频道：上一次还没算
 BOARD_EVERY = int(os.environ.get("BOT_BOARD_EVERY", "60"))
 
 
-def refresh_board(channel, create=False, force=True):
+def refresh_board(channel, create=False, force=True, new_round=False):
     """内容就是「进度」。create=True 发一条新的（新一轮发版 / 他要求重发看板），否则原地更新那一条。
     force=False 走 run_check 的缓存（有效期约 1 分钟），给定时刷新用，免得每分钟全量打一次 Jenkins。"""
     ch = STATE["channels"].get(channel)
@@ -567,25 +567,37 @@ def refresh_board(channel, create=False, force=True):
         except Exception as e:
             log.exception("board progress failed")
             body = "看板刷新失败：%s: %s" % (type(e).__name__, str(e)[:200])
-        text = "📋 *发版看板*  有站点在发布时每 %d 秒自动刷新 · 最后更新 %s\n\n%s" % (
-            BOARD_EVERY, time.strftime("%m-%d %H:%M:%S"), body)
+        now = time.strftime("%m-%d %H:%M:%S")
+        text = "📋 *发版看板*  有站点在发布时每 %d 秒自动刷新 · 最后更新 %s\n\n%s" % (BOARD_EVERY, now, body)
         try:
             if create or not (STATE["channels"].get(channel) or {}).get("board"):
                 old = ((STATE["channels"].get(channel) or {}).get("board") or {}).get("ts")
                 r = bolt.client.chat_postMessage(channel=channel, text=text, blocks=_sections(text))
                 if old:                          # 旧看板停更了，留着原样会让人以为进度卡住
                     try:
-                        moved = "📋 看板已移到频道下面最新一条，这条不再更新。"
+                        ob = (STATE["channels"].get(channel) or {}).get("board") or {}
+                        if new_round and ob.get("text"):
+                            # 11-17 他要：贴新站点清单开新一轮时，上一轮的看板保留最后的内容，只标「已停更」
+                            moved = "📋 *上一轮发版看板*  已停更 · 最后更新 %s（新一轮看板在频道下面）\n\n%s" % (
+                                ob.get("text_at", ""), ob["text"])
+                        else:                    # 同一轮「看板/进度」重发：内容一样，旧的只留一句免得重复
+                            moved = "📋 看板已移到频道下面最新一条，这条不再更新。"
                         bolt.client.chat_update(channel=channel, ts=old, text=moved, blocks=_sections(moved))
                     except Exception:
                         log.warning("retire old board failed")
                 with _state_lock:
                     # 写进频道「当前」的记录：算看板要几秒，这期间清单可能被整份替换，写旧对象等于丢了
-                    STATE["channels"].setdefault(channel, {})["board"] = {"ts": r["ts"], "at": time.time()}
+                    STATE["channels"].setdefault(channel, {})["board"] = {"ts": r["ts"], "at": time.time(),
+                                                                          "text": body, "text_at": now}
                     save_state(STATE)
             else:
                 ts = (STATE["channels"].get(channel) or {}).get("board", {}).get("ts")
                 bolt.client.chat_update(channel=channel, ts=ts, text=text, blocks=_sections(text))
+                with _state_lock:                # 记下最后内容：开新一轮时旧看板要保留它（写时现取当前记录）
+                    b = (STATE["channels"].get(channel) or {}).get("board")
+                    if b and b.get("ts") == ts:
+                        b.update(text=body, text_at=now)
+                        save_state(STATE)
         except Exception:
             log.exception("board post/update failed")
     finally:
@@ -593,8 +605,8 @@ def refresh_board(channel, create=False, force=True):
             _board_busy.discard(channel)
 
 
-def board_async(channel, create=False, force=True):
-    threading.Thread(target=refresh_board, args=(channel, create, force), daemon=True).start()
+def board_async(channel, create=False, force=True, new_round=False):
+    threading.Thread(target=refresh_board, args=(channel, create, force, new_round), daemon=True).start()
 
 
 def board_ticker():
