@@ -64,6 +64,20 @@ PROBE_TRIES, PROBE_GAP = 3, 20  # 刚部署完 IIS 要预热，不正常就隔 2
 # Web-Pages 发完检查前端产物（11-14 AR064 黑屏：CF success + 全 200，但首页 chunk 引用没打包进去）。"0" 关掉
 PAGES_CHECK = os.environ.get("BOT_PAGES_CHECK", "1") != "0"
 
+# 11-17 他说结论里 Pages 链接被 Slack 展开成整张站点大图预览 → 全局关掉链接/媒体预览。
+# Bolt 每个请求会新建 WebClient（listener 里的 client、say 都是），所以补在类上而不是 bolt.client 实例上。
+from slack_sdk import WebClient as _WC
+_orig_post = _WC.chat_postMessage
+
+
+def _post_no_unfurl(self, *a, **kw):
+    kw.setdefault("unfurl_links", False)
+    kw.setdefault("unfurl_media", False)
+    return _orig_post(self, *a, **kw)
+
+
+_WC.chat_postMessage = _post_no_unfurl
+
 # BOT_OFFLINE=1：本地测试 handle() 时不去 Slack 校验 token
 bolt = App(token=os.environ["SLACK_BOT_TOKEN"],
            token_verification_enabled=os.environ.get("BOT_OFFLINE") != "1")
