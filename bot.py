@@ -901,7 +901,8 @@ def build_plan(site, comps, group_hint, jobs):
                 want = val if val is not None else app.normalize_ref(c["expect"])
                 if fixed and (c.get("fixed") or app.ref_matches(fixed, want)):   # fixed=没写分支，按它固定拉的发
                     lines.append("• *%s* `%s`　不传参数（流水线固定拉 `%s`）" % (view, n, fixed))
-                    targets.append({"which": AR, "view": view, "job": n, "pname": "", "value": fixed})
+                    targets.append({"which": AR, "view": view, "job": n, "pname": "", "value": fixed,
+                                    "last": fixed, "same": True})
                 elif fixed:
                     lines.append("• *%s* `%s` → ❌ 没有分支参数，流水线固定拉 `%s`，发不了 `%s`；要改得去改 job 配置"
                                  % (view, n, fixed, want))
@@ -920,8 +921,11 @@ def build_plan(site, comps, group_hint, jobs):
                 flags.append("⏳ 正在构建 #%s，确认时会跳过" % j["num"])
             lines.append("• *%s* `%s`　%s=`%s`%s" % (
                 view, n, j["pname"], val, ("\n　　" + "；".join(flags)) if flags else ""))
-            targets.append({"which": AR, "view": view, "job": n, "pname": j["pname"], "value": val})
-    head = "*%s %s*" % (site, disp)
+            targets.append({"which": AR, "view": view, "job": n, "pname": j["pname"], "value": val,
+                            # 11-17 他要「全部确认」汇总里标出分支 + 是否和上次一致
+                            "last": app.normalize_ref(j["last"]) if j["last"] else None,
+                            "same": bool(j["last"]) and app.ref_matches(j["last"], val)})
+    head ="*%s %s*" % (site, disp)
     if need_group:
         head += "（%s%s）" % (group or "分组未知", "，" + gsrc if gsrc else "")
     head += " — 共 %d 个 job" % len(targets)
@@ -1121,7 +1125,8 @@ def cmd_plan(channel, text, thread, say, view=None):
     # 11-13 他要的：一条消息多个站（如 web-pages 重发几个站）一个个点太慢 → 末尾给「全部确认」
     if len(ready) >= 2:
         lines = ["*%d 个站的计划都没问题，可以一起确认*" % len(ready)]
-        lines += ["• %s %s　%d 个 job" % (p["site"], p.get("disp", ""), len(p["targets"])) for _, p in ready]
+        for _, p in ready:
+            lines += _confirm_all_lines(p)
         if blocked:
             lines.append("_不含 %s（计划里有 ❓/⚠ 或没有可发的 job，单独处理）_" % "、".join(blocked))
         val = ",".join("%s:%s" % (pid, p["site"]) for pid, p in ready)   # 带站点名：已单独点过的也能说清是哪个站
@@ -1138,6 +1143,41 @@ def cmd_plan(channel, text, thread, say, view=None):
             {"type": "context", "elements": [{"type": "mrkdwn",
              "text": "上面每个站的按钮也还能单独点；点过的站不会被重复触发。15 分钟内有效。"}]}]
         say(text="\n".join(lines), blocks=blocks, thread_ts=thread)
+
+
+def _same_tag(t):
+    """和上次实际发的分支比：✅ 同上次 / ↔ 换分支 / 上次无记录。"""
+    if t["which"] == ADMIN:
+        return "后台包 `%s`" % (t.get("admin_ver") or "?")
+    if t.get("same"):
+        return "✅ 和上次一致"
+    if t.get("last") and not branch_switch(t["last"], t["value"]):
+        return "⬆ 升版本  上次 `%s`" % t["last"]
+    if t.get("last"):
+        return "↔ *换分支*  上次 `%s`" % t["last"]
+    return "❔ 上次分支没记录"
+
+
+def _confirm_all_lines(p):
+    """11-17 他要的：全部确认汇总里每站标出分支 + 是否和上次发版一致。
+    一站一个 job（或多个 job 同分支且都一致）一行写完；否则每个 job 一行。"""
+    ts = p["targets"]
+    head = "• %s %s" % (p["site"], p.get("disp", ""))
+    ar = [t for t in ts if t["which"] != ADMIN]
+    if len(ts) == 1 or (ar and len(ar) == len(ts) and len({t["value"] for t in ar}) == 1
+                        and all(t.get("same") for t in ar)):
+        t = ts[0]
+        if t["which"] == ADMIN:
+            return ["%s　%s" % (head, _same_tag(t))]
+        name = t["view"] if len(ts) == 1 else "%d 个 job" % len(ts)
+        return ["%s　%s `%s`　%s" % (head, name, t["value"], _same_tag(t))]
+    out = ["%s　%d 个 job" % (head, len(ts))]
+    for t in ts:
+        if t["which"] == ADMIN:
+            out.append("　　后台 Admin　%s" % _same_tag(t))
+        else:
+            out.append("　　%s `%s`　%s" % (t["view"], t["value"], _same_tag(t)))
+    return out
 
 
 # ---------------------------------------------------------------- 发布
