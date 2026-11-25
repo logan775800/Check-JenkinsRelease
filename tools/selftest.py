@@ -54,7 +54,20 @@ for s in ("AR001", "AR002", "AR020"):
 
 
 # tree 参数里的 [ ] { } , 是 safe 字符，不会被百分号编码，所以路径可以直接按子串认
-NAMES_PATH = "jobs[name,url]"
+NAMES_PATH = "jobs[name,url"
+# 11-25 新流程 Fast-* job：名字没有国家后缀、参数 BUILD_NO，必须被排除（同站同组件不能多出一条）
+FAST_JOBS = {"AR001-LotteryApi": "BUILD_NO", "AR002-LotteryApi": "BUILD_NO"}
+PARAM_OF = {n: "BRANCH_NAME" for n in JOBS if "-Pages" in n}
+PARAM_OF.update(FAST_JOBS)
+
+
+def _names_resp():
+    out = []
+    for n in list(JOBS) + list(FAST_JOBS):
+        p = PARAM_OF.get(n, "TAG")
+        out.append({"name": n, "url": "https://fake/job/%s/" % n,
+                    "property": [{"parameterDefinitions": [{"name": p}]}]})
+    return {"jobs": out}
 BULK_PATH = "jobs[name,builds["
 
 
@@ -69,7 +82,7 @@ def is_bulk(p):
 def fake_get(path, user, token_, timeout=180):
     CALLS.append(path)
     if is_names(path):
-        return {"jobs": [{"name": n, "url": "https://fake/job/%s/" % n} for n in JOBS]}
+        return _names_resp()
     if path.startswith("/job/"):
         name = urllib.parse.unquote(path.split("/job/")[1].split("/api/json")[0])
         if name not in JOBS:
@@ -607,6 +620,26 @@ s14 = {x["job"]: x["state"] for x in r14["rows"]}
 check("端到端：中台 feature/V3.08_001 按简写判 OK", s14.get("AR001-Pages-印度-site1") == "OK", s14)
 check("端到端：非中台按自己分组的期望判 VER", s14.get("AR002-Pages-印度-site2") == "VER", s14)
 add("AR001-Pages-印度-site1", [mkbuild(10, NOW, param="BRANCH_NAME")])
+
+# 11-25 Jenkins 新流程 Fast-* job 排除 + 视图改名
+def _pj(name, p):
+    return {"name": name, "property": [{"parameterDefinitions": [{"name": p}]}]}
+check("Fast job（无后缀+BUILD_NO）识别", app.is_fast_job(_pj("AR001-LotteryApi", "BUILD_NO")))
+check("Old job 不算 Fast", not app.is_fast_job(_pj("AR001-LotteryApi-印度-82Bet", "TAG")))
+check("无后缀老 Pages job（BRANCH_NAME）不误伤", not app.is_fast_job(_pj("AR010-Pages", "BRANCH_NAME")))
+check("带后缀但参数 BUILD_NO 也不算（只认两个条件同时满足）",
+      not app.is_fast_job(_pj("AR001-LotteryApi-印度-x", "BUILD_NO")))
+check("没参数定义的无后缀 job 不算 Fast", not app.is_fast_job({"name": "AR001-RebateJob"}))
+reset()
+add("AR001-LotteryApi-印度-x", [mkbuild(10, NOW)])
+r15 = run("AR001\nLotteryApi → tag: master_V3.07_008\n")
+j15 = [x["job"] for x in r15["rows"]]
+check("核对里不出现 Fast job", "AR001-LotteryApi" not in j15 and "AR001-LotteryApi-印度-x" in j15, j15)
+check("显示视图名改成 Old-LotteryApi", {x.get("view") for x in r15["rows"]} == {"Old-LotteryApi"}, r15["rows"])
+for w, want in (("h5web", "Pages"), ("H5Web", "Pages"), ("Old-LotteryApi", "LotteryApi"), ("old-agentweb", "Web"),
+                ("Agent_Web", "Web"), ("Web-Pages", "Pages"), ("Old-RebateJob", "RebateJob")):
+    c, _ = app.parse_components("%s → 分支: master_V3.07_008" % w)
+    check("新视图名 %s 认成 %s" % (w, want), [x["name"] for x in c] == [want], c)
 
 print("\n" + ("全部通过" if not fails else "失败 %d 项：%s" % (len(fails), fails)))
 sys.exit(1 if fails else 0)

@@ -239,6 +239,8 @@ def jenkins_index(force=False):
         jobs = {}
         for j in data.get("jobs") or []:
             name = j.get("name") or ""
+            if app.is_fast_job(j):        # 新流程 Fast-* job 不进计划，只发 Old-* 那套
+                continue
             site, comp = app.site_of(name), app.component_of(name)
             if not site or not comp:
                 continue
@@ -1690,7 +1692,7 @@ def run_release(p, user, client, resume=None):
         # 3c. Web-Pages 发完检查前端产物；Jenkins/CF 都报成功也可能黑屏（11-14 AR064）
         if PAGES_CHECK:
             for t in targets:
-                if t["which"] == AR and t["view"] == "Web-Pages" and t.get("state") == "done" and \
+                if t["which"] == AR and t["view"] in app.PAGES_VIEWS and t.get("state") == "done" and \
                         (t.get("build") or {}).get("result") == "SUCCESS" and t.get("num"):
                     try:
                         pages_probe(t)

@@ -116,6 +116,11 @@ COMPONENT_ALIAS = {
     "thirdjob": "ThirdJob",
     # RebateJob：没有分支参数，分支写死在流水线里（10-21 实查 78 个全是 master）
     "rebatejob": "RebateJob", "rebate": "RebateJob",
+    # 11-25 Jenkins 视图改名后的视图名本身（Logan 确认的对应关系），照着机器人显示的名字打也能认
+    "h5web": "Pages",
+    "oldlotteryapi": "LotteryApi", "oldwebintranetapi": "WebIntranetApi", "oldwebextendapi": "WebExtendApi",
+    "oldagentapi": "AgentApi", "oldagentweb": "Web", "oldthirdapi": "ThirdApi", "oldthirdjob": "ThirdJob",
+    "oldrebatejob": "RebateJob",
 }
 
 
@@ -126,12 +131,16 @@ def canon(s):
     s = re.sub(r"[\s\-_]+", "", (s or "").strip().lower())
     return re.sub(r"^v1(?=[a-z一-龥])", "", s)
 # 组件 -> Jenkins 视图名，页面上按视图分组展示
+# 11-25：Jenkins 视图改名（旧视图 → Old-*，Web-Pages → H5Web），显示名跟着改，方便去 Jenkins 对照。
+# 只用于显示；找 job 靠 site_of/component_of 按 job 名匹配，不依赖视图名。
 COMPONENT_VIEW = {
-    "Pages": "Web-Pages", "LotteryApi": "LotteryApi", "AgentApi": "AgentApi",
-    "Web": "Agent_Web", "WebExtendApi": "WebExtendApi",
-    "WebIntranetApi": "WebIntranetApi", "ThirdApi": "ThirdApi", "ThirdJob": "ThirdJob",
-    "RebateJob": "RebateJob",
+    "Pages": "H5Web", "LotteryApi": "Old-LotteryApi", "AgentApi": "Old-AgentApi",
+    "Web": "Old-AgentWeb", "WebExtendApi": "Old-WebExtendApi",
+    "WebIntranetApi": "Old-WebIntranetApi", "ThirdApi": "Old-ThirdApi", "ThirdJob": "Old-ThirdJob",
+    "RebateJob": "Old-RebateJob",
 }
+# 改名前记下的在途/历史记录里 Pages 还叫 Web-Pages，判断「是不是 Pages」两个都认
+PAGES_VIEWS = {"Web-Pages", COMPONENT_VIEW["Pages"]}
 # 发布单里会出现、但不在这套 AR 命名的 Jenkins 上的组件
 NOT_IN_JENKINS = {"admin", "sitadmin", "后台", "后台管理"}
 
@@ -215,8 +224,9 @@ def fetch_job_names(user, token_, force=False):
         # 等锁期间别人已经拉过一轮：那一轮就是这次刷新，force 也直接用它的结果
         if hit and (hit["ts"] >= t0 or (not force and time.time() - hit["ts"] < CACHE_TTL)):
             return hit["jobs"]
-        data = jenkins_get("/api/json" + _q("jobs[name,url]"), user, token_, timeout=120)
-        jobs = data.get("jobs", []) or []
+        data = jenkins_get("/api/json" + _q("jobs[name,url,property[parameterDefinitions[name]]]"),
+                           user, token_, timeout=120)
+        jobs = [j for j in (data.get("jobs", []) or []) if not is_fast_job(j)]
         with _cache_lock:
             b["names"] = {"ts": time.time(), "jobs": jobs}
         return jobs
@@ -481,6 +491,19 @@ def ref_matches(actual, expect):
 def site_of(job_name):
     m = re.match(r"^(AR\d+)-", job_name)
     return m.group(1) if m else ""
+
+
+def is_fast_job(job):
+    """11-17 起 Jenkins 新流程的 Fast-* 视图 job（AR001-LotteryApi：没有国家后缀，参数 BUILD_NO，从 XXX-Build 拷包部署）。
+    机器人和核对目前只管 Old-* 那套（带国家后缀、传 TAG），Fast job 一律排除，否则同一站同一服务会出两条。
+    两个条件都要满足：只看名字会误伤就叫 AR001-Pages 这种无后缀的老 job。"""
+    if not re.match(r"^AR\d+-[A-Za-z]+$", job.get("name") or ""):
+        return False
+    for p in job.get("property") or []:
+        for d in (p or {}).get("parameterDefinitions") or []:
+            if d.get("name") == "BUILD_NO":
+                return True
+    return False
 
 
 def component_of(job_name):
