@@ -126,7 +126,7 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 .\Check-JenkinsRelease.ps1 -Branch 'masterBranch/main-1.00' -OnlyProblem
 
 # 3) 构建历史：某天/某几天，可按视图、站点、组件过滤
-.\Check-JenkinsRelease.ps1 -History -View 'Web-Pages'
+.\Check-JenkinsRelease.ps1 -History -View 'H5Web'
 .\Check-JenkinsRelease.ps1 -History -Date '2026-01-01' -Days 3 -OnlyProblem
 .\Check-JenkinsRelease.ps1 -History -Site 'AR001','AR002'
 .\Check-JenkinsRelease.ps1 -History -Component 'LotteryApi','ThirdJob'
@@ -149,6 +149,8 @@ python app.py                    # 浏览器开 http://127.0.0.1:8770
 和 `Get-SiteCode` / `Get-Component`（PowerShell）。**
 
 组件名到 Jenkins 视图名的映射在 `COMPONENT_VIEW`，别名在 `COMPONENT_ALIAS`。
+
+**11-25 Jenkins 视图改名**：旧视图改为 `Old-LotteryApi` / `Old-AgentWeb` 等 8 个 `Old-*`，Web-Pages 改为 `H5Web`；另有新流程 `Build` + `Fast-*` 视图（job 名 `AR001-LotteryApi`，无国家后缀，参数 `BUILD_NO`）。核对按 job 名匹配、不依赖视图名；Fast job 由 `is_fast_job` 排除，只核对 Old 那套。`-View` 参数要写 Jenkins 上现在的视图名。
 
 - Python 3.6+（只用标准库，无第三方依赖）
 - PowerShell 5.1+

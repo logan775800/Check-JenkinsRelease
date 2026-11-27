@@ -40,7 +40,7 @@
 
 .EXAMPLE
     # 缩到指定视图 + 导出 CSV
-    .\Check-JenkinsRelease.ps1 -Branch 'master_V3.08_003' -View 'LotteryApi','Web-Pages' -CsvPath .\release.csv
+    .\Check-JenkinsRelease.ps1 -Branch 'master_V3.08_003' -View 'Old-LotteryApi','H5Web' -CsvPath .\release.csv
 
 .NOTES
     API Token 生成：https://your-jenkins-host/me/security/ -> API Token -> 添加新 Token

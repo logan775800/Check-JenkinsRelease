@@ -423,7 +423,7 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 *一、整轮发版*  （多个站、每个站发全部服务）
 1. 记服务清单（每次发版先发一次）：`@jenkins-bot 服务` 换行贴「服务 → 分支」几行
 　 例：`Web → 分支：非中台 uat ／ 中台 feature/v3-uat` （`非中台：uat / 中台：feature/v3-uat` 这样带冒号也行）；整份发布单贴进来也行，站点清单和分组会一起记住
-　 贴完看机器人回的「已记下」：Web-Pages 应该是 *（非中台）uat* 和 *（中台）feature/v3-uat* 两条，分组名不对就别往下发
+　 贴完看机器人回的「已记下」：H5Web 应该是 *（非中台）uat* 和 *（中台）feature/v3-uat* 两条，分组名不对就别往下发
 2. 记站点清单：`@jenkins-bot 站点` 换行贴站点清单（带「中台站 / 非中台站」标题）
 　 → 频道里出一条 📋 发版看板，发布中每 60 秒自动刷新
 3. 发某个站（全部服务）：`@jenkins-bot ar107` ；一次最多 5 个站：`@jenkins-bot ar107 ar108`
@@ -431,15 +431,16 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 5. 发完线程里回结论表（每个服务的实际分支、构建号、时间、代码版本）→ 接着 @ 下一个站
 
 *二、单独发某个视图*  （临时需求；写法：视图名 + 站点 + 分支，分支只这一次有效，不改服务清单）
-`@jenkins-bot agentapi ar107 master`
-`@jenkins-bot agent_web ar107 master`
-`@jenkins-bot lotteryapi ar107 master_V3.11_017`
-`@jenkins-bot rebatejob ar107` ← 不用写分支，固定 master
-`@jenkins-bot thirdapi ar107 uat`
-`@jenkins-bot thirdjob ar107 uat`
-`@jenkins-bot web-pages ar107 feature/v3-uat` ← 也可以写 web
-`@jenkins-bot webextendapi ar107 master_V3.11_017`
-`@jenkins-bot webintranetapi ar107 master_V3.11_017`
+视图名照 Jenkins 现在的叫法写（前面的 Old- 可省），旧叫法也认：
+`@jenkins-bot old-agentapi ar107 master` ← 也可以写 agentapi
+`@jenkins-bot old-agentweb ar107 master` ← 也可以写 agentweb / agent_web
+`@jenkins-bot old-lotteryapi ar107 master_V3.11_017` ← 也可以写 lotteryapi
+`@jenkins-bot old-rebatejob ar107` ← 不用写分支，固定 master
+`@jenkins-bot old-thirdapi ar107 uat`
+`@jenkins-bot old-thirdjob ar107 uat`
+`@jenkins-bot h5web ar107 feature/v3-uat` ← 也可以写 web / web-pages
+`@jenkins-bot old-webextendapi ar107 master_V3.11_017`
+`@jenkins-bot old-webintranetapi ar107 master_V3.11_017`
 `@jenkins-bot admin ar107 master_V3.11_010` ← 后台那套 Jenkins
 • 不写分支：用当前服务清单里这个视图的分支　`@jenkins-bot lotteryapi ar107`
 • 多个视图：逗号隔开　`@jenkins-bot lotteryapi,webextendapi,webintranetapi ar107 master_V3.11_017`
@@ -459,9 +460,10 @@ HELP = """*jenkins-bot 操作用法*  （频道里 @jenkins-bot 加指令；私�
 　 不点也行：全站发完的结论下面还有 *重发失败的* 按钮（这时前面那些单个按钮自动作废，免得发两遍）；都是 15 分钟内有效
 • 报错是 `MSB4166 Child node exited prematurely` → 编译进程中途退出，不是代码错误（日志里 0 Error），部署也没执行，重发即可
 • 每个站发完自动打开本站后台地址检查：崩了（服务器错误/打不开）→ Admin 判 ❌ 并给重发按钮；结论里 🌐 那行就是检查结果
-• 发了 Web-Pages 的站自动检查前端：把这次部署的 JS 全部走一遍，有文件缺失/引用没打包进去（打开会黑屏白屏）→ Web-Pages 判 ❌，给出最后一个正常版本方便回滚；结论里 🌐 前端 那行就是检查结果。这种重发没用，要前端修代码
+• 发了 H5Web（Pages）的站自动检查前端：把这次部署的 JS 全部走一遍，有文件缺失/引用没打包进去（打开会黑屏白屏）→ H5Web 判 ❌，给出最后一个正常版本方便回滚；结论里 🌐 前端 那行就是检查结果。这种重发没用，要前端修代码
 
 *五、规则*
+• 机器人只发 *Old-xxx 视图* 和 *H5Web* 的 job（带国家后缀的那套，如 `AR001-LotteryApi-印度-82Bet`）；新流程 *Build + Fast-xxx 视图* （先编一次包再批量发）机器人不发、也不核对，走 Jenkins 上的「全站发布」
 • 只有授权的人点「确认发布」「重发」才生效；计划 15 分钟内有效，点一次就失效
 • 参数明确传入，不用 Jenkins 默认值；分支简写自动展开（v3-uat → feature/v3-uat）
 • 后台 build_admin 同一版本只打一次包，版本对上就直接发本站后台
